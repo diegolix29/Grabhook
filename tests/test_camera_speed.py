@@ -118,11 +118,15 @@ def source_checks():
     check("hos_camera_scale = camera_scale(rx_option(HOS_OPT_CAMERA_SPEED, 100));" in block(vi, "static void realtime_step("),
           "the scale is not set from the menu's row at each present (100% without the renderer's menu)")
     replay = (ROOT / "gpu" / "vk" / "vk_replay.cpp").read_text(encoding="utf-8")
-    api = (ROOT / "gpu" / "vk" / "vk_api.h").read_text(encoding="utf-8")
+    api = (ROOT / "gpu" / "vk" / "vk_api.h").read_text(encoding="utf-8") + (ROOT / "gpu" / "vk" / "oot_wheel_state.h").read_text(encoding="utf-8")   # (the item wheel's two ids: kept out of vk_api.h)
     value = {}   # (every HOS_OPT_* enum)
     for first, start, rest in re.findall(r"enum \{ (HOS_OPT_\w+) = (\d+)(?:, ([^}]*))? \}", api):
         names = [first] + [n.strip() for n in (rest or "").split(",") if n.strip()]
         value.update({n: int(start) + i for i, n in enumerate(names)})
+    cheats = (ROOT / "gpu" / "vk" / "oot_cheat_items.h").read_text(encoding="utf-8")   # (the game side's own ids: OOT_CHEAT_AGE_ID)
+    value.update({n: int(v) for n, v in re.findall(r"#define (OOT_CHEAT_\w+) (\d+)", cheats)})
+    capture = (ROOT / "gpu" / "vk" / "oot_teleport_capture.h").read_text(encoding="utf-8")   # (the Travel pictures' id)
+    value.update({n: int(v) for n, v in re.findall(r"#define (HOS_OPT_\w+) (\d+)", capture)})
     check("HOS_OPT_CAMERA_SPEED" in value, "vk_api.h has no HOS_OPT_CAMERA_SPEED")
     table = block(replay, "t.option = [](int id) -> int {")
     ids = [int(n) if n.isdigit() else value[n] for n in re.findall(r"\bid == (\w+)", table)]

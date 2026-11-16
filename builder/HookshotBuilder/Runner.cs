@@ -6,6 +6,10 @@ namespace HookshotBuilder;
 /// Where nx2/make_game.py and its Python are: a "tools" folder beside the app when packaged, or the source tree it sits in.
 sealed record Tools(string Root, string Python, string[]? PythonArgs = null)
 {
+    /// The toolchain's switches a game folder's build was made with (BuildRecord.cs): set over the others, so a rebuild is
+    /// that build again
+    public IReadOnlyDictionary<string, string>? Env { get; init; }
+
     /// Which release these tools are (tools/version.txt, written when the release is packed); null from the source tree
     public string? Version => File.Exists(Path.Combine(Root, "version.txt")) ? File.ReadAllText(Path.Combine(Root, "version.txt")).Trim() : null;
 
@@ -131,6 +135,7 @@ sealed class Runner
             var path = Path.Combine(tools.Root, folder);
             if (Directory.Exists(path)) si.Environment[name] = path;
         }
+        foreach (var (k, v) in tools.Env ?? new Dictionary<string, string>()) si.Environment[k] = v;
         foreach (var a in tools.PythonArgs ?? Array.Empty<string>()) si.ArgumentList.Add(a);
         si.ArgumentList.Add("-I");
         si.ArgumentList.Add(Path.Combine(tools.Root, "nx2", "make_game.py"));

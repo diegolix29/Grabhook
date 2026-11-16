@@ -292,6 +292,21 @@ def patch_menu_tick(source):
         '#include "a64.h"\n', '#include "a64.h"\nextern void hos_oot_menu_tick(Ctx *c, uint64_t screen);\n', 1)
 
 
+def patch_wheel_tick(source):
+    """(hookshot) f_802f1380, the same menu screen's update, also calls hos_wheel_menu_tick with the screen: the item row shown
+    as the item wheel (host/oot_wheel.c), which does nothing with the Gameplay tab's Item wheel row off. None without the
+    function; the source as it is when patched before"""
+    start = source.find(MENU_TICK_HEAD)
+    if start < 0:
+        return None
+    if "hos_wheel_menu_tick(c," in source:   # (made before: a lift patched again)
+        return source
+    at = start + len(MENU_TICK_HEAD)
+    hook = "    hos_wheel_menu_tick(c, c->x[0]);   /* (nx2/oot_patches.py: the item wheel) */\n"
+    return (source[:at] + hook + source[at:]).replace(
+        '#include "a64.h"\n', '#include "a64.h"\nextern int hos_wheel_menu_tick(Ctx *c, uint64_t screen);\n', 1)
+
+
 TEXT_DRAW_HEAD = "void f_8152b670(Ctx *__restrict A64_NOESC c) {\n"
 TEXT_LAYOUT_HEAD = "void f_8152aec0(Ctx *__restrict A64_NOESC c) {\n"
 GLYPH_HEAD = "void f_81680c60(Ctx *__restrict A64_NOESC c) {\n"
@@ -925,6 +940,11 @@ def patch_file(s, name, protect_hearts=False):
         out = tick
         counts["menu tick hook"] += 1
         lines.append("oot_patches: the menus' update hook in " + name)
+    wheel = patch_wheel_tick(out) if protect_hearts else None
+    if wheel is not None:
+        out = wheel
+        counts["item wheel hook"] += 1
+        lines.append("oot_patches: the item wheel's menu hook in " + name)
     draw = patch_text_draw(out) if protect_hearts else None
     if draw is not None:
         out = draw
@@ -1123,6 +1143,7 @@ def report(paths, counts, protect_hearts=False):
     if protect_hearts:   # (the supported build's: these places are its functions)
         done["menu focus hook"] = 0
         done["menu tick hook"] = 0
+        done["item wheel hook"] = 0
         done["text draw hook"] = 0
         done["glyph hook"] = 0
         done["text layout hook"] = 0

@@ -346,11 +346,11 @@ Camera, Mouse, Movement and Menu. The table lists those tabs' rows in that order
 | | Custom output size | A size of your own, typed as `<width>x<height>` (after a restart) | None |
 | | Profile | Docked, Handheld (after a restart) | Docked |
 | | Upscaler | Game's own, NVIDIA DLSS, NVIDIA DLAA (only in builds with NVIDIA's DLSS SDK, below; DLSS and DLAA on RTX GPUs), AMD FSR 3.1 (every build, on GPUs it runs on, below), AMD FSR 4, AMD FSR 4 Native AA (only in builds with FSR 4, below), Off (no upscaling) | Game's own |
-| | DLSS model | Transformer (K), Transformer 2 (M), Transformer 2 (L), NVIDIA default (shown where DLSS runs; used by DLSS and DLAA) | Transformer (K) |
+| | DLSS model | Transformer (K) (CNN (E) in its place on cards with less than 7 GB of video memory), Transformer 2 (M), Transformer 2 (L), NVIDIA default (shown where DLSS runs; used by DLSS and DLAA) | Transformer (K); CNN (E) under 7 GB |
 | | Render resolution | Auto (the game's own dynamic resolution), 100%, 75%, 67%, 50% (each with its size). With DLSS, FSR 3.1 or FSR 4: Auto, Quality (67%), Balanced (58%), Performance (50%), Ultra Performance (33%). With DLAA or FSR 4 Native AA: Native. With Off: Auto, 100%, 75%, 67%, 50%, 33% | Auto |
 | | Sharpness | 0 to 100%, in steps of 10 | 0% |
 | | Frame generation | Off, Auto, 2x to 8x | Off |
-| | Frame generation by | Auto (NVIDIA DLSS Frame Generation where it runs: RTX 40 and newer, with a temporal Upscaler; else the built-in one; with frame generation on, the row shows who makes the frames, as Auto: DLSS FG, and why not DLSS FG when another does), Built-in FG (changes at once) | Auto |
+| | Frame generation by | DLSS FG (NVIDIA DLSS Frame Generation: RTX 40 and newer, with a temporal Upscaler), Built-in FG. DLSS FG is offered only where it runs; elsewhere the row has Built-in FG alone and its line says why (the log has NVIDIA's answer). At DLSS FG, the game's own menus, movies and loading screens show only the game's own frames (they have no Upscaler picture to make frames from): the row's line and the FPS counter say DLSS FG paused. With an Upscaler that is not temporal, the built-in one makes the frames and the line says why. `RX_VK_DLSS_FG=1` fixes the row at DLSS FG for a run. Changes at once | DLSS FG where it runs, else Built-in FG (an options file's Auto from before is this default) |
 | | Frame pacing | Off, On | Off |
 | | Game frame rate cap | 60, 90, 120, 144, 165, 240 FPS, Uncapped, 30 FPS (after a restart) | 60 FPS |
 | | NVIDIA Reflex | Off, On, On + Boost (shown only on NVIDIA GPUs with `VK_NV_low_latency2`) | Off |
@@ -382,10 +382,14 @@ Camera, Mouse, Movement and Menu. The table lists those tabs' rows in that order
 | | Output device | Default or a named Windows playback device; applies live | Default |
 | | Speaker layout | Auto, Stereo, 5.1, Mono (layout changes after a restart; Mono/Stereo live on stereo output) | Auto |
 | | Microphone | Off, Default, or each microphone by name | Default |
+| | Microphone gain | Software input level, 0–400%; applies to new samples without changing system volume | 100% |
+| | Test microphone | Start/stop capture; live levels appear in the help box for Test microphone and Microphone gain | Stopped |
 | Gameplay | Game speed | Per frame, Real time | Real time |
 | | Field of view | 50% to 150%, in steps of 5; applies immediately during gameplay | 100% (original) |
 | | Skip title screen | Off, On (after a restart) | Off |
 | | Skip opening | Off, On (skips the new-game opening: the story movie and Navi waking Link; later cutscenes and the title screen stay) | Off |
+| | Item wheel | Off, On (hold R or L for a wheel of your items: point with either stick, let go to equip) | Off |
+| | Cycle items | Off, Last used, Basic, +Bombs, +Tools (a tap of R or L changes the item on ZR within its group) | Off |
 | | Text speed | Normal, 2x, 4x, Instant | Normal |
 | | Text size | Original, 110%, 125%, 150%, 175% (dialogue, Navi and signs) | Original |
 | | Game language | The game's 16 languages, each by its own name (after a restart) | The one built with |
@@ -409,6 +413,7 @@ Camera, Mouse, Movement and Menu. The table lists those tabs' rows in that order
 | | Mouse camera | As the stick, Native | As the stick |
 | | Mouse sensitivity | 0.10 to 5.00 | 1.00 |
 | | Invert mouse vertical | Off, On | Off |
+| | Invert mouse horizontal | Off, On | Off |
 | | Auto run | Off, On | Off |
 | | Walk mode | Hold, Toggle | Hold |
 | | Walk speed | 15% to 90%, in steps of 5 | 45% |
@@ -599,6 +604,14 @@ Camera, Mouse, Movement and Menu. The table lists those tabs' rows in that order
   once. A chosen microphone that is unplugged stays chosen (shown as not connected): Default stands in until it is
   back. On Linux (SDL2) two microphones with the same name cannot be told apart: the first is used. Windows must allow desktop apps to use the microphone
   (Settings, Privacy & security, Microphone). `HOS_MIC_LOG=1` logs what the game reads, a line a second.
+- **Microphone gain** changes captured samples for Hookshot only, from 0% to 400% (100% unchanged); it does not change
+  the system's input volume. Boosting raises noise too, and excessive levels clip. It applies to newly captured samples;
+  samples already buffered for the game keep their previous gain.
+- **Test microphone** starts and stops capture on request. During a test, the help box for Test microphone and
+  Microphone gain shows a read-only bar labeled Testing, with the incoming percentage before gain and the adjusted one
+  after it, and says when it clips, falls back to the default device, cannot capture or has no recent samples. Opening
+  the Audio tab alone never starts a test, and Microphone Off prevents one; leaving the tab, closing the menu or losing
+  focus stops it. No microphone sound is played back or saved.
 - **Game language** is the game's own text, `language.txt` in the game folder: the row writes it once you leave the row,
   and the game reads it at its next start (`HOS_LANGUAGE`, when set, wins over the file, as for the game). Where the
   folder cannot be written the row goes back to the file's language. **Menu language** is this menu's: Auto follows the
@@ -924,7 +937,8 @@ license. Never share a game folder built with them, and do not post builds made 
   that folder in `RX_VK_DLSS_DIR`.
 
 The **DLSS model** row chooses DLSS's network, by NVIDIA's preset letter, for every mode: **Transformer (K)**, the
-transformer model and the one tested most here (the default); **Transformer 2 (M)**, NVIDIA's second-generation
+transformer model and the one tested most here (the default; on a card with less than 7 GB of video memory **CNN (E)**
+in its place, NVIDIA's CNN model, for less video memory and GPU time); **Transformer 2 (M)**, NVIDIA's second-generation
 transformer as it picks it for Performance; **Transformer 2 (L)**, the same generation as tuned for Ultra Performance;
 **NVIDIA default**, which lets DLSS's runtime pick for each mode, so it can change with a runtime update. The runtime
 the SDK comes with (310.9.16) has all of them. A change applies at once, without a restart (`dlss_model=` in
@@ -1006,6 +1020,14 @@ switch that stands in for a menu row (`RX_VK_PACE`, `RX_VK_UPSCALE`, `RX_VK_FRAM
 To enable the debug tools, turn **Debug tools** on in the menu's Debug tab (or add `HOS_OOT_CHEATS=1` to
 `hookshot_env.txt` in the game folder). The tools then show below it on the same tab. The tab's Developer section,
 always shown, has the Descriptor reuse, Sampler cache, Robust buffers and ASTC as RGBA8 rows.
+
+**Travel** (a debug tool, beside Teleport) opens a page of 190 places to go to: villages, dungeons' entrances, shops,
+warp points and story spots, grouped by area, for Link's age (Tab, X on a pad, or the Child and Adult buttons show the other
+age's: going there makes Link that age). Once you have opened the page, each place gets a picture taken from your own game
+the first time Link stays there a few seconds with the menu closed (in `teleport_pictures` in the game folder, with a short
+"Travel picture saved" line over the game); Backspace or Y on the page takes a place's picture again at the next stay there.
+Link arrives through the game's own map change, as when he walks in. The places' positions and arrival events come from
+your game files at every build (`teleport_places.bin`, `nx2/teleport_places.py`).
 
 A save whose minimap stopped showing after a Teleport on an earlier build (the area left had hidden it, and the flag
 stayed set in the save) is mended by the Teleport itself: teleport to an outdoor area, wait until you can move, then
@@ -1132,6 +1154,8 @@ Hookshot exists thanks to the work of many people:
 - **[kinnay/zbic](https://github.com/kinnay/zbic)**, **Opus** and **SDL**: decompression, audio and controllers.
 - **[sostenesfreitas/ocarina-recomp](https://github.com/sostenesfreitas/ocarina-recomp)**: this README's layout, and its notes
   confirmed the mesh stage's control section.
+- **HanSoloBlaster and afiaka87** ([Fast Travel](https://github.com/afiaka87/oots2-release)): the Travel page's list of
+  places (MIT).
 - **[MythosOfs/Orchid](https://github.com/MythosOfs/Orchid)**: the fog and exposure workaround the game used before
   its fog and lighting were fixed.
 - **Mesa (NAK)**: the reference for Ampere's instruction encoding.
@@ -1145,7 +1169,8 @@ Hookshot exists thanks to the work of many people:
 Hookshot is free software under the [GNU General Public License, version 3 or later](LICENSE) (GPL-3.0-or-later).
 It includes code from Eden and suyu, which are under the GPL too. Third-party parts under other licenses that
 work with the GPL (Sirit, the Vulkan Memory Allocator, SDL, Opus, Dear ImGui, zstd, the Libertinus fonts, zbic and the
-a64-kit tools) keep their own notices in their folders.
+a64-kit tools) keep their own notices in their folders. The Travel page's list of places follows the Fast Travel mod's
+(MIT): its notice is in `gpu/vk/oot_tp_places.LICENSE`.
 
 Hookshot is an unofficial fan project, not affiliated with or endorsed by Nintendo. The Legend of Zelda and Ocarina of
 Time are trademarks of Nintendo.

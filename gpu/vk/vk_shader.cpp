@@ -99,6 +99,7 @@ void ptr_diag_log(uint64_t key, const char* kind) {
 }
 } // namespace
 #include "vk_shader.h"
+#include "mesh_mode.h"
 #ifndef HOOKSHOT_ENV_H   // (env_on: the switches' one rule)
 #include "hookshot_env.h"
 #endif
@@ -751,6 +752,40 @@ std::unique_ptr<Translation> translate(Env& env, bool graphics, bool one_exit = 
 
 } // namespace
 
+/// The denorm modes (DenormPreserve, DenormFlushToZero) a shader declares for a width the device does not report, and their
+/// capability when it reports none of that kind, taken out of the module's preamble. Eden declares them for any program that
+/// uses them (the profile says every device has them), validation calls each one an error, and a driver that does not know a mode
+/// need not ignore it. A program loaded from the program cache is cleaned here too, so the cache stays as it was.
+std::vector<uint32_t> strip_float_controls(const std::vector<uint32_t>& spirv, uint32_t preserve, uint32_t flush) {
+    constexpr uint32_t kOpCapability = 17, kOpExecutionMode = 16, kOpFunction = 54;
+    constexpr uint32_t kModePreserve = 4459, kModeFlush = 4460, kCapPreserve = 4464, kCapFlush = 4465;
+    const auto width_bit = [](uint32_t w) { return w == 16 ? 1u : w == 32 ? 2u : w == 64 ? 4u : 0u; };
+    std::vector<uint32_t> out;
+    bool changed = false;
+    size_t i = 5;
+    while (i < spirv.size()) {
+        const uint32_t op = spirv[i] & 0xFFFF, wc = spirv[i] >> 16;
+        if (!wc || i + wc > spirv.size() || op == kOpFunction) break;
+        bool drop = false;
+        if (op == kOpExecutionMode && wc == 4) {
+            if (spirv[i + 2] == kModePreserve) drop = !(preserve & width_bit(spirv[i + 3]));
+            if (spirv[i + 2] == kModeFlush) drop = !(flush & width_bit(spirv[i + 3]));
+        } else if (op == kOpCapability) {
+            if (spirv[i + 1] == kCapPreserve) drop = !preserve;
+            if (spirv[i + 1] == kCapFlush) drop = !flush;
+        }
+        if (drop && !changed) {
+            changed = true;
+            out.assign(spirv.begin(), spirv.begin() + i);
+        }
+        if (changed && !drop) out.insert(out.end(), spirv.begin() + i, spirv.begin() + i + wc);
+        i += wc;
+    }
+    if (!changed) return {};
+    out.insert(out.end(), spirv.begin() + i, spirv.end());
+    return out;
+}
+
 bool spirv_uses_subgroups(const std::vector<uint32_t>& spirv) {
     if (spirv.size() < 5 || spirv[0] != 0x07230203u) return true;   // (not SPIR-V we can read: as if it did)
     for (size_t i = 5; i < spirv.size();) {
@@ -769,7 +804,13 @@ bool spirv_uses_subgroups(const std::vector<uint32_t>& spirv) {
 }
 
 thread_local uint64_t module_program = 0;   // (translate_into's program, for make_module's callers that do not name it)
-VkShaderModule make_module(const std::vector<uint32_t>& spirv, uint64_t program, bool* busy) {
+VkShaderModule make_module(const std::vector<uint32_t>& spirv_in, uint64_t program, bool* busy) {
+    // (RX_VK_KEEP_DENORM=1: the modules as translated, to compare a picture or a number with and without the strip)
+    static const bool keep = env_on("RX_VK_KEEP_DENORM");
+    const bool lacks = !keep && (dev.denorm_preserve_widths != 7 || dev.denorm_flush_widths != 7);
+    const std::vector<uint32_t> cleaned = lacks ? strip_float_controls(spirv_in, dev.denorm_preserve_widths, dev.denorm_flush_widths)
+                                                : std::vector<uint32_t>{};
+    const std::vector<uint32_t>& spirv = cleaned.empty() ? spirv_in : cleaned;
     if (!program) program = module_program;
     if (driver_faulted_program(program)) return VK_NULL_HANDLE;
     VkShaderModuleCreateInfo ci{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
@@ -1270,6 +1311,18 @@ bool mesh_nocull_wanted(uint64_t code_key) {
     return false;
 }
 
+} // namespace
+uint32_t mesh_fallback_layout() {
+    static const uint32_t layout = [] {
+        const mesh_rule::Choice c = mesh_rule::fb_layout(getenv("RX_VK_MESH_FB_LAYOUT"));
+        // (once, on a GPU that translates a fallback program: which layout its records take, set or not)
+        logf("vk: mesh fallback records: %s (%s)", c.mode == 1 ? "line after line (soa)" : "record after record (aos)", c.why);
+        return (uint32_t)c.mode;
+    }();
+    return layout;
+}
+namespace {
+
 bool reads_c3_2320_bit4(const Shader::IR::Value& v) {   // (BitwiseAnd32 of #4 and GetCbufU32 #3, #2320, through Identity)
     using namespace Shader::IR;
     const Value r = v.Resolve();
@@ -1373,11 +1426,19 @@ uint64_t translator_stamp() {
         // (and the vendor fixes of the translation, vk_vendor.h: out-of-bounds fetches, NaN tests, the gather offset)
         const uint32_t flags = (position_invariant ? 1u : 0u) | (frag_nan_guard ? 2u : 0u) | (mma_software ? 4u : 0u) |
                                (global_table_loop ? 8u : 0u) | (fetch_bounds ? 16u : 0u) | (nan_bits ? 32u : 0u) |
-                               (profile().need_gather_subpixel_offset ? 64u : 0u) | (fetch_bounds_buffers ? 128u : 0u);
+                               (profile().need_gather_subpixel_offset ? 64u : 0u) | (fetch_bounds_buffers ? 128u : 0u) |
+                               // (and the software multiplies' form, vk_coopmat.cpp choose_software_form: 0 for the loop, as before)
+                               (mma_software ? mma_software_form << 8 | (mma_software_form && mma_software_quad ? 1024u : 0u) : 0u);
         add(&flags, sizeof flags);
         add(mma_order_a.data(), sizeof(uint32_t) * mma_order_a.size());
         add(mma_order_b.data(), sizeof(uint32_t) * mma_order_b.size());
         add(mma_order_c.data(), sizeof(uint32_t) * mma_order_c.size());
+    }
+    // (hookshot: and whether a float add is the GPU's own atomic (make_profile): a program made with OpAtomicFAddEXT is no use
+    // to a GPU without it. Added only when it is, so that the stamp of every GPU that keeps the loop is what it was)
+    if (dev.float_atomic_add) {
+        const uint32_t float_add = 1;
+        add(&float_add, sizeof float_add);
     }
     // (and whether a float add is the GPU's own atomic (make_profile): a program made with OpAtomicFAddEXT is no use to a GPU
     // without it, nor one made with RX_VK_NATIVE_FADD=0's loop wanted back once it is native again)
@@ -1804,6 +1865,7 @@ void translate_mesh_into(Program& p, const NvnState& s, const Code* task, const 
         mrt.mesh_fallback_capacity = Shader::Backend::SPIRV::MESH_FALLBACK_CAPACITY;
         mrt.mesh_fallback_task = task_t != nullptr;
         mrt.mesh_fallback_task_threads = task_t ? task_t->program.workgroup_size[0] : 0;
+        mrt.mesh_fallback_layout = fallback ? mesh_fallback_layout() : 0;
         const std::vector<uint32_t> mspirv = Shader::Backend::SPIRV::EmitSPIRV(fallback ? profile_pinned() : profile_graphics(VK_SHADER_STAGE_MESH_BIT_EXT), mrt, mesh_t->program, bindings);
         kept.push_back(mspirv);
         Stage ms;
@@ -1819,6 +1881,7 @@ void translate_mesh_into(Program& p, const NvnState& s, const Code* task, const 
             vrt.mesh_fallback = true;
             vrt.mesh_fallback_vertex = true;
             vrt.mesh_fallback_capacity = Shader::Backend::SPIRV::MESH_FALLBACK_CAPACITY;
+            vrt.mesh_fallback_layout = mrt.mesh_fallback_layout;
             vrt.convert_depth_mode = host->depth_minus_w() != 0;
             const Shader::Stage saved_stage{mesh_t->program.stage};
             // (the generated vertex stage has no descriptors of its own: its inputs are the records. Only the stores
@@ -2744,6 +2807,26 @@ const Program* program_find(uint64_t key, uint64_t variant) {
     for (auto& p : it->second)
         if (p->variant == variant && p->ready.load(std::memory_order_acquire) && !p->failed) return p.get();
     return nullptr;
+}
+
+bool program_variant_kept(uint64_t key, uint64_t variant) {
+    std::unordered_set<uint64_t> have;
+    loaded_variants(key, &have);
+    if (have.count(variant)) return true;
+    std::lock_guard lk(disk_mu);
+    const auto it = disk_records.find(key);
+    if (it == disk_records.end() || !disk_in) return false;
+    for (const DiskRecord& d : it->second) {
+        std::vector<uint8_t> data(std::min<size_t>(d.size, 1 << 16));   // (the answers come first)
+        _fseeki64(disk_in, d.at, SEEK_SET);
+        if (fread(data.data(), 1, data.size(), disk_in) != data.size()) continue;
+        Reader rd{data.data(), data.data() + data.size()};
+        Program q;
+        rd.get<uint32_t>();
+        rd.list(q.answers);
+        if (!rd.bad && answers_hash(q) == variant) return true;
+    }
+    return false;
 }
 
 void shader_stats(int64_t* translated, int64_t* failed) {

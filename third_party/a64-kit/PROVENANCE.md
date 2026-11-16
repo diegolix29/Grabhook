@@ -23,6 +23,11 @@ Changes made here after the copy (against Hookshot's first import of it, commit 
 - Hookshot, 2026-11-14, from a GPL fork of Hookshot: `lift/a64_lift.py`'s vector float sums (A64_VFPX_SUM)
   fix only the lanes the fast test gave up on, and the operations the fast paths and rescues give up on are done
   with the host's own arithmetic where Arm's result is known (FPX_EASY_HEADER), not the software body.
+- Hookshot: `lift/a64_lift.py`'s header helpers are all `always_inline` (marked `(hookshot)`), and the fast float regions' own: without the module inliner
+  (nx2/build.py `HOOKSHOT_LIGHT_PASSES`) VFPX_HEADER's 7 `a64_v_*` fell out of line, as real calls.
+- Hookshot: `lift/a64_lift.py`'s fast float checks are kept by the instruction's text (`ff_joins`, `ff_convs`,
+  `fp_is_frame_kept`, marked `(hookshot)`): the same C, the lift a third quicker on Windows.
+- Hookshot: `ff_region` takes `ff_min()` from its caller, read once a function (`least`, marked `(hookshot)`).
 
 So the copy can no longer be refreshed by copying the files again: a refresh keeps these changes, and the tree-sha256
 below is this folder's, not upstream's (python -I scripts/check_third_party.py).
@@ -30,4 +35,4 @@ below is this folder's, not upstream's (python -I scripts/check_third_party.py).
 Licensing: `lift/suyu/arm64_to_c.h` is suyu's (GPL-2.0-or-later, texts in `lift/suyu/`), so `a64emit.dll`, the
 generated runtime and all lifted C are GPL. See `NOTICE.TOTKPort.md`.
 
-tree-sha256: 2c6d34e53e14c64a0c371987a48d70e8eb8feb075d73ab8494552187d4cb60d1
+tree-sha256: 62e2b3b6441109ccfce200785d57c114292887e5184c12f8c604893cf4dbd0a4

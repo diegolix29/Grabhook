@@ -482,6 +482,22 @@ ImTextureData* logo(float* aspect) {
     *aspect = logo_aspect;
     return logo_;
 }
+ImTextureData* user_texture(int w, int h) {
+    ImTextureData* tex = IM_NEW(ImTextureData)();
+    tex->Create(ImTextureFormat_RGBA32, w, h);
+    memset(tex->GetPixels(), 0, (size_t)tex->GetSizeInBytes());
+    tex->UseColors = true;
+    ImGui::RegisterUserTexture(tex);
+    return tex;
+}
+void user_texture_changed(ImTextureData* tex) {
+    if (tex->Status != ImTextureStatus_OK) return;   // (still to be made: made with its pixels as they are then)
+    const ImTextureRect all{0, 0, (unsigned short)tex->Width, (unsigned short)tex->Height};
+    tex->Updates.clear();
+    tex->Updates.push_back(all);
+    tex->UpdateRect = all;
+    tex->SetStatus(ImTextureStatus_WantUpdates);
+}
 
 void idle() {
     if (!ready) return;

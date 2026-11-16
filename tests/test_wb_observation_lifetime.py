@@ -16,6 +16,9 @@ PRELUDE = r'''
 #include <cstring>
 #include <cstdio>
 #include <vector>
+#include <atomic>
+#include <deque>
+#include <mutex>
 #include "hookshot_env.h"
 // A rejected causal control must exit, not wait for an interactive CRT dialog.
 #undef assert

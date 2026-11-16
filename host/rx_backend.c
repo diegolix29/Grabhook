@@ -10,6 +10,7 @@
 #include <windows.h>
 
 #include "../gpu/vk/vk_api.h"
+#include "../gpu/vk/oot_wheel_state.h"   /* (hookshot: the item wheel's state, MKWVK_WHEEL_QUERY) */
 #include "../gpu/vk/dlss_math.h"
 #include "control.h"
 #ifndef HOOKSHOT_ENV_H   /* (env_on: the switches' one rule) */
@@ -63,6 +64,7 @@ int hos_binding(int set, int button, int slot);
 int hos_mic_count(void);            /* nn_audio_in.c: the microphones, for the Insert menu */
 const char *hos_mic_name(int index);
 void hos_mic_select(int mode, const char *name, int index);
+int hos_mic_test(int enabled, int gain, int *levels);
 void hos_bind(int set, int button, int slot, int code);
 int hos_prompts_face(void);         /* prompts.c */
 int hos_prompts_live_parts(void);   /* prompts.c */
@@ -227,6 +229,14 @@ int hos_sdl_gyro_status(void);   /* pad_sdl.c */
 extern const char *hos_romfs_dir;   /* nn_fs.c, set by hos_main.c */
 static const char *host_romfs_dir(void) { return hos_romfs_dir; }
 const char *hos_options_file(void);   /* options_path.c */
+const MkwVkWheel *hos_wheel_state(void);   /* oot_wheel.c (hookshot): the item wheel */
+/* (hookshot) With MKWVK_WHEEL_QUERY for the index, the microphones' name call answers another question: the item wheel's state,
+   a pointer as a name is one. A call of its own in the host's table would change vk_api.h, the program cache's stamp
+   (MKWVK_KEY_HELD below says the same of take_key_press) */
+static const char *host_mic_name(int index) {
+    if (index == MKWVK_WHEEL_QUERY) return (const char *)hos_wheel_state();
+    return hos_mic_name(index);
+}
 
 /* (the keys pressed since the Insert menu last looked: host/display.c on Windows, host/posix/display_sdl.c on Linux, and the
    pause menu's Recomp Options button, host/oot_pause_menu.c, which asks for F1) */
@@ -317,7 +327,7 @@ static const MkwVkHost vk_host = {
     nvn_tex_level_offset, nvn_fmt_bpb, nvn_tex_level_tiles, nvn_tex_linear_stride, nvn_depth_minus_w, hos_gpu_pools,
     hos_gpu_maps_generation, nvn_vmap_generation, hos_reserved_cpus, host_collect_in, host_guest_alloc,
     host_watch_guest_writes, hos_pad_raw, hos_binding, hos_bind, host_aspect_ratio, host_take_key_press,
-    hos_mouse_pointer, hos_mic_count, hos_mic_name, hos_mic_select, hos_sdl_gyro_status, hos_log_flush, hos_prompts_face,
+    hos_mouse_pointer, hos_mic_count, host_mic_name, hos_mic_select, hos_sdl_gyro_status, hos_log_flush, hos_prompts_face,
     host_romfs_dir, host_wide_menus, host_slept_ns, host_fps_timing, hos_prompts_live_parts, host_screen_size,
     hos_wide_cover,
     host_take_text,
@@ -325,6 +335,7 @@ static const MkwVkHost vk_host = {
     hos_options_file,
     hos_mod_info, hos_mod_edit, hos_mods_changed, hos_cheat_info, hos_cheat_set,
     hos_audio_output_count, hos_audio_output_info, hos_audio_output_select, hos_audio_output_state,
+    hos_mic_test,
 };
 
 static const MkwVkRenderer *vk;   /* the Vulkan back end, when it was chosen and started */

@@ -24,6 +24,7 @@ partial class ToolsPage : UserControl
     int edited;
     public Action? Back;
     public Action<string>? Play;
+    public Action<string>? Rebuild;   // (MainWindow: the folder built again, as Update builds it, then its mix kept: PatchBuilds)
 
     public ToolsPage()
     {
@@ -45,6 +46,7 @@ partial class ToolsPage : UserControl
         mods = new ModList(game);
         modsDirty = false;
         FillMods();
+        Watch();
         ModsTab.IsChecked = true;
         Show(ModsView);
         SetStatus("");
@@ -53,6 +55,7 @@ partial class ToolsPage : UserControl
     /// The backend let go (the page left, or another game folder)
     public void Close()
     {
+        StopWatching();
         client?.Dispose();
         client = null;
         saveReady = false;
@@ -170,8 +173,153 @@ partial class ToolsPage : UserControl
     }
 
     // ================================================================ Mods
+    // ---- the mods' code patches: the mix ticked against the one the game was built with (PatchBuilds.cs)
+    string patchWant = "none";
+    void RefreshPatchBar()
+    {
+        if (mods == null) return;
+        patchWant = PatchBuilds.KeyOf(mods.PatchLines());
+        var built = PatchBuilds.KeyBuilt(game);
+        if (!mods.AnyPatches && built == "none" || patchWant == built)
+            PatchBar.Visibility = Visibility.Collapsed;
+        else
+        {
+            var before = PatchBuilds.Has(game, patchWant);
+            PatchText.Text = "The code patches ticked are not the ones this game was built with. " +
+                             (before ? "It was built with this mix before: Apply switches to it in a few seconds."
+                                     : "Rebuild to use them (as long as an update: the code is translated again). Until then the game plays as it was built.");
+            PatchButton.Content = before ? "Apply" : "Rebuild";
+            PatchBar.Visibility = Visibility.Visible;
+        }
+        var kept = PatchBuilds.Size(game);
+        KeptRow.Visibility = kept > 0 ? Visibility.Visible : Visibility.Collapsed;
+        KeptText.Text = $"Builds kept for other mixes of code patches: {Finder.Size(kept)}";
+    }
+
+    async void PatchClick(object sender, RoutedEventArgs e)
+    {
+        if (mods == null) return;
+        if (GameRunning(game)) { SetStatus("Close the game first.", true); return; }
+        PatchButton.IsEnabled = false;
+        try
+        {
+            mods.Save();   // (the build reads the ticks from hookshot_mods.txt)
+            modsDirty = false;
+            var want = patchWant;
+            SetStatus("Keeping this build for its mix of patches…");
+            await Task.Run(() => PatchBuilds.Store(game));   // (the mix in the folder now: switching back to it is a copy too)
+            if (await Task.Run(() => PatchBuilds.Restore(game, want)))
+            {
+                SetStatus("Switched to the build with these code patches.");
+                RefreshPatchBar();
+                return;
+            }
+            Close();
+            Rebuild?.Invoke(game);
+        }
+        catch (Exception ex) { SetStatus("Not switched: " + ex.Message, true); }
+        finally { PatchButton.IsEnabled = true; }
+    }
+
+    void FreeKeptClick(object sender, RoutedEventArgs e)
+    {
+        try { PatchBuilds.Clear(game); } catch (Exception ex) { SetStatus("Not freed: " + ex.Message, true); }
+        RefreshPatchBar();
+    }
+
+    // ---- the mods folder watched while the page is open: a mod copied in, taken out or changed shows at once (Refresh keeps
+    // the switches and order made here). Changes come in bursts (a copy is many files): read once they settle, 600 ms
+    FileSystemWatcher? folderWatch, modsWatch;
+    System.Windows.Threading.DispatcherTimer? settle;
+
+    void Changed() => Dispatcher.BeginInvoke(() => { settle?.Stop(); settle?.Start(); });
+
+    void Watch()
+    {
+        StopWatching();
+        settle = new System.Windows.Threading.DispatcherTimer { Interval = TimeSpan.FromMilliseconds(600) };
+        settle.Tick += (_, _) => { settle?.Stop(); ReloadMods(auto: true); };
+        try
+        {
+            // (the game folder itself, not its subfolders: a mods folder made, removed or renamed, then the mods folder watched)
+            folderWatch = new FileSystemWatcher(game) { NotifyFilter = NotifyFilters.DirectoryName, IncludeSubdirectories = false };
+            folderWatch.Created += (_, e) => { if (IsModsFolder(e.FullPath)) { Dispatcher.BeginInvoke(WatchMods); Changed(); } };
+            folderWatch.Deleted += (_, e) => { if (IsModsFolder(e.FullPath)) Changed(); };
+            folderWatch.Renamed += (_, e) => { if (IsModsFolder(e.FullPath) || IsModsFolder(e.OldFullPath)) { Dispatcher.BeginInvoke(WatchMods); Changed(); } };
+            folderWatch.EnableRaisingEvents = true;
+        }
+        catch (Exception) { folderWatch = null; }
+        WatchMods();
+    }
+
+    void WatchMods()
+    {
+        modsWatch?.Dispose();
+        modsWatch = null;
+        if (mods == null || !Directory.Exists(mods.Root)) return;
+        try
+        {
+            modsWatch = new FileSystemWatcher(mods.Root)
+            {
+                IncludeSubdirectories = true,
+                NotifyFilter = NotifyFilters.DirectoryName | NotifyFilters.FileName | NotifyFilters.LastWrite | NotifyFilters.Size,
+            };
+            modsWatch.Created += (_, _) => Changed();
+            modsWatch.Deleted += (_, _) => Changed();
+            modsWatch.Changed += (_, _) => Changed();
+            modsWatch.Renamed += (_, _) => Changed();
+            modsWatch.Error += (_, _) => Dispatcher.BeginInvoke(() => { WatchMods(); Changed(); });   // (too many changes at once)
+            modsWatch.EnableRaisingEvents = true;
+        }
+        catch (Exception) { modsWatch = null; }
+    }
+
+    bool IsModsFolder(string path) =>
+        mods != null && string.Equals(Path.TrimEndingDirectorySeparator(path), Path.TrimEndingDirectorySeparator(mods.Root), StringComparison.OrdinalIgnoreCase);
+
+    void StopWatching()
+    {
+        settle?.Stop();
+        settle = null;
+        folderWatch?.Dispose();
+        modsWatch?.Dispose();
+        folderWatch = modsWatch = null;
+    }
+
+    void ReloadMods(bool auto)
+    {
+        if (mods == null) return;
+        var names = mods.Mods.Select(m => m.Name).ToHashSet();
+        mods.Refresh();
+        var added = mods.Mods.Where(m => !names.Contains(m.Name)).Select(m => m.Name.Split('/').Last()).ToList();
+        var gone = names.Count - (mods.Mods.Count - added.Count);
+        FillMods();
+        if (added.Count > 0) SetStatus("New in the mods folder: " + string.Join(", ", added) + ". It's ticked: Save to keep it.");
+        else if (gone > 0) SetStatus($"{gone} mod{(gone == 1 ? "" : "s")} gone from the mods folder.");
+        else if (!auto) SetStatus("The mods folder read again.");
+    }
+
+    async void ReloadClick(object sender, RoutedEventArgs e)
+    {
+        if (ModsView.Visibility == Visibility.Visible) { ReloadMods(auto: false); return; }
+        if (client == null || !saveReady) return;
+        if (edited > 0 && MessageBox.Show(Window.GetWindow(this), "Read the saves again and drop the changes not saved yet?", "Hookshot",
+                                          MessageBoxButton.YesNo, MessageBoxImage.Question) != MessageBoxResult.Yes)
+            return;
+        var keep = SlotPick.SelectedItem is ComboBoxItem { Tag: ValueTuple<string, string> t } ? t : default;
+        client.Dispose();
+        client = null;
+        saveReady = false;
+        edited = 0;
+        await StartSaves();   // (the slots listed again, a save made since among them; then the slot that was open)
+        foreach (ComboBoxItem item in SlotPick.Items)
+            if (item.Tag is ValueTuple<string, string> t2 && t2 == keep && SlotPick.SelectedItem != item) { SlotPick.SelectedItem = item; break; }
+        SetStatus("The saves read again.");
+    }
+
     void FillMods()
     {
+        RefreshPatchBar();
         ModRows.Children.Clear();
         if (mods == null) return;
         if (mods.Mods.Count == 0)
@@ -366,7 +514,7 @@ partial class ToolsPage : UserControl
         string text(double? d) => d is { } x ? x.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture) : "";
 
         var life = Card("Health and magic");
-        Line(life, "Hearts", Box(text(num("hearts")), v => SetStat("hearts", v)), $"of {text(num("max_hearts"))}", ("Fill", () => Fill("hearts")));
+        Line(life, "Hearts", Box(text(num("hearts")), v => SetStat("hearts", v)), $"of {text(num("max_hearts"))} (the containers)", ("Fill", () => Fill("hearts")));
         Line(life, "Heart containers", Box(text(num("max_hearts")), v => SetStat("max_hearts", v)), "3 to 20");
         Line(life, "Magic meter", Pick(st["meters"]!.AsArray(), st["meter"]!.GetValue<int>(), i => SetStat("meter", i.ToString())));
         Line(life, "Magic", Box(text(num("magic")), v => SetStat("magic", v)), $"of {text(num("max_magic"))}", ("Fill", () => Fill("magic")));

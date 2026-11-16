@@ -75,6 +75,8 @@ bool predict_pending(){return pending;}
 bool all_mode=true;
 bool compile_all(){return all_mode;}   // (the level read; the real completion reader is cut out above)
 void precompile_run(void(*progress)(size_t,size_t)){calls.push_back(2);progress(1,2);}
+bool state_list_pending(){return false;}   // (no shipped list newer than the prepare: nothing to note)
+void state_list_run(){std::exit(4);}
 void pipeline_cache_save(bool force){if(!force)std::exit(2);calls.push_back(3);}
 std::string skipped_path(){return "sentinel";}
 void prepare_watchdog(){}   // (vk_main.cpp: the run's watchdog, tests/test_prepare_stall.py)

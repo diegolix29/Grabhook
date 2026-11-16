@@ -39,7 +39,7 @@ T=$APPDIR/usr/share/hookshot
 L=$APPDIR/usr/lib/hookshot   # (what the image builds with: emsdk's clang, FFmpeg, SDL2, the sysroot; AppRun points there)
 
 # ---- the tools (the sources the player's build compiles, and the scripts) ----
-cp -a nx2 host scripts LICENSE readme.md assets "$T/"
+cp -a nx2 host scripts LICENSE readme.md assets native "$T/"
 printf '%s
 ' "$VERSION" > "$T/VERSION"   # (no git history in here: nx2/version.py reads the release name from it)
 mkdir -p "$T/builder" "$T/gpu/render" "$T/gpu/vk" "$T/third_party"
@@ -103,7 +103,15 @@ S=$L/sysroot
 mkdir -p "$S/usr/lib/x86_64-linux-gnu" "$S/usr/lib/gcc/x86_64-linux-gnu" "$S/lib64"
 ln -s usr/lib "$S/lib"
 cp -a /usr/include "$S/usr/"
-rm -rf "$S/usr/include/c++" "$S/usr/include/x86_64-linux-gnu/c++" "$S/usr/include/llvm"* "$S/usr/include/clang"*
+# (GCC's C++ headers stay, its newest version only: engine/native's C++ (hl/stream, hl/jobs...) is compiled at the player's
+# build since the native engine came in, and the bundled clang finds them through the sysroot's GCC install below: without
+# them a player's build stops at "'cstddef' file not found")
+rm -rf "$S/usr/include/llvm"* "$S/usr/include/clang"*
+CXXV=$(basename "$(ls -d /usr/lib/gcc/x86_64-linux-gnu/*/ | sort -V | tail -1)")   # (the GCC whose runtime is carried below)
+[ -d "/usr/include/c++/$CXXV" ] || { echo "no C++ headers for GCC $CXXV (g++-$CXXV / libstdc++-$CXXV-dev)"; exit 1; }
+for d in "$S/usr/include/c++" "$S/usr/include/x86_64-linux-gnu/c++"; do
+    [ -d "$d" ] && find "$d" -mindepth 1 -maxdepth 1 ! -name "$CXXV" -exec rm -rf {} +
+done
 M=/usr/lib/x86_64-linux-gnu
 for f in crt1.o crti.o crtn.o Scrt1.o rcrt1.o libc.so libc.so.6 libc_nonshared.a libm.so libm.so.6 libm.a libmvec.so libmvec.so.1 \
          libmvec.a libpthread.so.0 libpthread.a libdl.so.2 libdl.a librt.so.1 librt.a libutil.a libgcc_s.so.1 ld-linux-x86-64.so.2; do
@@ -118,7 +126,7 @@ G=$S/usr/lib/gcc/x86_64-linux-gnu/$GV
 mkdir -p "$G" "$S/usr/include/c++" "$S/usr/include/x86_64-linux-gnu/c++"
 cp -aL "/usr/include/c++/$GV" "$S/usr/include/c++/"
 cp -aL "/usr/include/x86_64-linux-gnu/c++/$GV" "$S/usr/include/x86_64-linux-gnu/c++/"
-for f in crtbegin.o crtbeginS.o crtbeginT.o crtend.o crtendS.o libgcc.a libgcc_eh.a libgcc_s.so libstdc++.a libstdc++fs.a libstdc++exp.a; do
+for f in crtbegin.o crtbeginS.o crtbeginT.o crtend.o crtendS.o libgcc.a libgcc_eh.a libgcc_s.so libstdc++.a libstdc++fs.a libstdc++exp.a libsupc++.a; do
     [ -e "$GCC/$f" ] && cp -aL "$GCC/$f" "$G/" || true
 done
 # (libgcc_s.so is a linker script naming /lib/x86_64-linux-gnu/libgcc_s.so.1: found in the sysroot through lib -> usr/lib)
@@ -141,6 +149,28 @@ int main(void) { pthread_t t; pthread_create(&t, 0, f, 0); pthread_join(t, 0); p
 EOF
 "$L/emsdk/upstream/bin/clang" --sysroot="$S" -fuse-ld=lld -O2 -march=x86-64-v3 "$B/t.c" -o "$B/t" -lpthread -lm
 "$B/t"
+# (and C++20 the way nx2/build.py compiles and links engine/native: the headers its sources include, libstdc++ linked in)
+cat > "$B/t.cpp" <<'EOF'
+#include <algorithm>
+#include <atomic>
+#include <bit>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <functional>
+#include <span>
+#include <vector>
+int main() {
+    std::atomic<uint64_t> a{1}; std::vector<int> v{3, 1, 2}; std::sort(v.begin(), v.end());
+    std::function<int(int)> f = [](int x) { return x + 1; }; std::span<int> s(v);
+    std::printf("ok %d %d %d\n", (int)a.fetch_add(1), f(s[0]), std::popcount(7u));
+    return 0;
+}
+EOF
+"$L/emsdk/upstream/bin/clang" --sysroot="$S" -fuse-ld=lld -std=c++20 -O2 -march=x86-64-v3 -c "$B/t.cpp" -o "$B/tcpp.o"
+"$L/emsdk/upstream/bin/clang" --sysroot="$S" -fuse-ld=lld -O2 "$B/tcpp.o" -o "$B/tcpp" -l:libstdc++.a -lpthread -lm
+"$B/tcpp"
 cat > "$B/t.cpp" <<'EOF'
 #include <algorithm>
 #include <filesystem>

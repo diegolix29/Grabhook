@@ -1156,4 +1156,14 @@ unsigned prepare_cpus() {
     return prepare_workers::count(half_cpus(), usable_cpus(), avail_mb, segment_heap());
 }
 
+/// (hookshot) How many program keys the program cache holds now (SIZE_MAX: it is off). vk_draw.cpp's prepare check compares it with
+/// what the last prepare left there: a cache cut short or made again under another stamp (a start with other shader settings,
+/// stopped before it prepared) has lost what the record says was prepared
+size_t program_cache_kept() {
+    disk_init();
+    if (!disk_on) return SIZE_MAX;
+    std::lock_guard lk(disk_mu);
+    return disk_records.size();
+}
+
 } // namespace mkwvk

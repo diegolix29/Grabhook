@@ -60,7 +60,8 @@ struct Info {
 }
 #include "cache_types.inc"
 
-struct { uintptr_t device = 123; } dev;
+struct { uintptr_t device = 123; uint32_t denorm_preserve_widths = 7, denorm_flush_widths = 7; } dev;
+std::vector<uint32_t> strip_float_controls(const std::vector<uint32_t>&, uint32_t, uint32_t) { return {}; }   // (every mode here)
 // the made-up driver: a module's handle says which code it was made of (the SPIR-V's second word) and how long it was
 unsigned created = 0, destroyed = 0;
 std::map<VkShaderModule, std::pair<uint32_t, size_t>> made_of;

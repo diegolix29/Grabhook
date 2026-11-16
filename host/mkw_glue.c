@@ -2,6 +2,7 @@
    commit (TOTK commits its whole 4 GB window up front; MKW's 512 GB window is only reserved), and stand-ins for the
    hooks of files not taken into host/ (the renderer and display, the profiler, mods, TOTK's own patches). */
 #include "hos.h"
+#include "hos_guestpages.h"
 #include "hos_crash_record.h"
 #include "hos_paths.h"
 #ifndef HOOKSHOT_ENV_H   /* (env_on: the switches' one rule) */
@@ -20,6 +21,25 @@
    The runtime commits what it hands out (image, system region, heap, address regions: hos_commit), because host
    APIs given guest buffers (ReadFile into a game buffer) fail on reserved pages without raising an exception. A
    guest or host access to a page nothing committed is committed on first touch, 64 KB at a time, by the handler. */
+int hos_lazy_commit(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("HOS_LAZY_COMMIT");
+        on = e && e[0] == '1';   /* (off by default here: Hookshot commits on touch its own way, commit_on_touch) */
+    }
+    return on;
+}
+
+/* (HOS_GUEST_PAGES: not while a drop splits the reservation; the error kept for the caller) */
+static int hos_plain_commit(void *p, size_t n) {
+    hos_gp_hold(1);
+    const int ok = VirtualAlloc(p, (SIZE_T)n, MEM_COMMIT, PAGE_READWRITE) != NULL;
+    const DWORD err = GetLastError();
+    hos_gp_hold(0);
+    SetLastError(err);
+    return ok;
+}
+
 /* (hookshot) a commit refused at Windows' commit limit (1455: RAM and page file full) is tried again for up to 5 s: the renderer's
    textures give commit back below a reserve (vk_texture.cpp's commit rule: every VRAM block is charged to the process's commit).
    Before, the commit failed and the game's next write to those pages crashed it: a 16 GB PC at 33.9 GB of commit, an area loading
@@ -53,6 +73,34 @@ static void commit_refused(uint64_t lo, uint64_t size, DWORD err) {
     }
 }
 
+/* HOS_GUEST_PAGES=1 (hos_guestpages.c): the window in two reservations, the system region and the image below
+   HOS_HEAP_BASE as before, the heap and the address regions over a placeholder, so that their granules can be given back
+   and restored atomically. 0 (the default, and whenever this fails): the one reservation of before. Not with the
+   hardware write watch (a placeholder cannot be write-watched) */
+int hos_reserve_guest_pages(int write_watch) {
+    if (!hos_gp_wanted()) return 0;
+    if (write_watch) {
+        hos_log("mem: guest pages: off (HOS_GUEST_PAGES needs the soft write watch build)");
+        return 0;
+    }
+    if (VirtualAlloc(GP(0), (SIZE_T)HOS_HEAP_BASE, MEM_RESERVE, PAGE_NOACCESS) != GP(0)) {
+        hos_log("mem: guest pages: off (the window's low part was not reserved, error %lu)", GetLastError());
+        return 0;
+    }
+    if (!hos_gp_reserve(GP(HOS_HEAP_BASE), (size_t)(HOS_GUEST_SPACE - HOS_HEAP_BASE))) {
+        VirtualFree(GP(0), 0, MEM_RELEASE);
+        hos_log("mem: guest pages: off (the placeholder was not made: the window is reserved as before)");
+        return 0;
+    }
+    hos_log("mem: guest pages: on: the heap and the address regions (%llu GB) over a placeholder, granules of %zu KB can be "
+            "dropped and restored (HOS_GUEST_PAGES=0: not)", (unsigned long long)((HOS_GUEST_SPACE - HOS_HEAP_BASE) >> 30),
+            hos_gp_granule() >> 10);
+    void hos_gp_check_start(void);   /* (hos_gpcheck.c: the counters, and HOS_GUEST_PAGES_TEST) */
+    hos_gp_check_start();
+    hl_drop_init();   /* (HL_MEM_DROP, hl_drop.c: the policy over the substrate) */
+    return 1;
+}
+
 /* (hookshot) Windows answers VirtualQuery (and the driver's import of a host pointer, vkAllocateMemory) with the run of
    pages after the address that share its state and protection, found by walking them: ~2.3 ms a GB. The heap is one
    committed run of many GB, so each import of a new GPU pool cost ~28-44 ms twice (query, then the driver's own) on the
@@ -79,14 +127,24 @@ int hos_commit(uint64_t addr, uint64_t size) {
         return 0;
     }
     const uint64_t lo = addr & ~0xFFFFULL, hi = (addr + size + 0xFFFF) & ~0xFFFFULL;
-    if (!VirtualAlloc(GP(lo), (SIZE_T)(hi - lo), MEM_COMMIT, PAGE_READWRITE)) {
+    /* (HOS_POOL_TRAP, hos_memsplit.c: trapped pages the kernel is given get their access back first, and are counted) */
+    { void hos_pool_trap_release(uint64_t, uint64_t, const char *); hos_pool_trap_release(lo, hi - lo, "hos_commit"); }
+    /* (HL_MEM_DROP, hl_drop.c: a decision under way over these pages ends first, and they are not dropped for a while) */
+    hl_drop_kernel_begin(lo, hi);
+    /* (HOS_GUEST_PAGES: dropped granules the kernel is given are restored by their owner first, and the commit goes piece by
+       piece around them; off, the one commit of before) */
+    const int done = hos_gp_ready() && hos_gp_touches(GP(lo), (size_t)(hi - lo)) ? hos_gp_commit(GP(lo), (size_t)(hi - lo))
+                                                                                 : hos_plain_commit(GP(lo), (size_t)(hi - lo));
+    if (!done) {
         const DWORD err = GetLastError();
-        if (err == ERROR_COMMITMENT_LIMIT && commit_wait(GP(lo), (SIZE_T)(hi - lo))) return 1;
+        if (err == ERROR_COMMITMENT_LIMIT && commit_wait(GP(lo), (SIZE_T)(hi - lo))) return hl_drop_kernel_end(), 1;
         commit_refused(lo, hi - lo, err);
+        hl_drop_kernel_end();
         return 0;
     } else {
         commit_marks(lo, hi);   /* (hookshot) an RWX page every 64 MB of a commit: VirtualQuery's walks stay short */
     }
+    hl_drop_kernel_end();
     return 1;
 }
 
@@ -108,6 +166,15 @@ static LONG CALLBACK commit_on_touch(EXCEPTION_POINTERS *info) {
     if (p < A64_MEM || p >= A64_MEM + HOS_GUEST_SPACE) return EXCEPTION_CONTINUE_SEARCH;
     const uint64_t guest = (uint64_t)(p - A64_MEM);
     if (guest < 0x100000) return EXCEPTION_CONTINUE_SEARCH;   /* (a null pointer: the game's own fault) */
+    /* (HOS_GUEST_PAGES: a dropped granule goes to its owner, which restores it; one it declines is a crash) */
+    if (hos_gp_ready()) {
+        const int r = hos_gp_fault((void *)p, rec->ExceptionInformation[0] == 1);
+        if (r > 0) return EXCEPTION_CONTINUE_EXECUTION;
+        if (r < 0) {
+            hos_log("mem: %#llx is in a dropped granule that was not restored", (unsigned long long)guest);
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+    }
     MEMORY_BASIC_INFORMATION mbi;
     if (!VirtualQuery(p, &mbi, sizeof mbi)) return EXCEPTION_CONTINUE_SEARCH;
 #ifdef _WIN32
@@ -301,6 +368,10 @@ static LONG WINAPI report_crash(EXCEPTION_POINTERS *info) {
                         (unsigned long long)peek_guest(base + row + 16), (unsigned long long)peek_guest(base + row + 24));
         }
     }
+    {   /* (HL_TRACE: the blocks the fault and the registers are in, the last events; hl_trace.c) */
+        void hl_trace_on_crash(Ctx *, uint64_t);
+        hl_trace_on_crash(c, addr - (uint64_t)A64_MEM);
+    }
     hos_log_flush();
     void hos_hostcall_stats(void);
     hos_hostcall_stats();   /* (HOS_HOSTCALL_STATS=1: the host calls made, and the last 256 of them) */
@@ -351,6 +422,9 @@ void hos_commit_init(void) {
     SetUnhandledExceptionFilter(report_crash);
     const char *after = getenv("HOS_STATS_AFTER");
     if (after && atoi(after) > 0) CreateThread(NULL, 0, stats_after, (void *)(uintptr_t)atoi(after), 0, NULL);
+    { void hos_memsplit_init(void); hos_memsplit_init(); }   /* (HOS_MEM_SPLIT, hos_memsplit.c) */
+    { void hos_hostsplit_init(void); hos_hostsplit_init(); }   /* (HOS_HOST_SPLIT, hos_hostsplit.c) */
+    { void hl_trace_gates(void); hl_trace_gates(); }         /* (HL_TRACE, hl_trace.c) */
 }
 
 /* ---- stand-ins --------------------------------------------------------------------------------------------- */

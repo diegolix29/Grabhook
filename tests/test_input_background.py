@@ -99,6 +99,7 @@ static void host_stick_read(int32_t stick[4]) { (void)stick; }
 static void host_drag_read(int32_t stick[4]) { (void)stick; }
 static void player_used(void) {}
 uint64_t hos_pausebtn_buttons(uint64_t buttons, uint64_t a) { (void)a; return buttons; }   /* (host/oot_pause_menu.c: not on a pause menu) */
+uint64_t hos_wheel_input(uint64_t buttons, int32_t stick[4]) { (void)stick; return buttons; }   /* (host/oot_wheel.c: the item wheel closed) */
 """
     actual = "\n".join(("static HoldToggle toggles;", cheat_state, cheat_spies, host_spies, game_keys(hid), block(hid, "static int kmap_down("),
         block(hid, "static int game_in_front("), hid[start:end],

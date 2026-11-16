@@ -17,6 +17,11 @@
 // closes the window as the player would, and the game starts again (WM_APP + 9: host/hos_relaunch.c).
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
+#include <deque>
+#include <filesystem>
+#include <map>
+#include <thread>
 #include <cmath>
 #include <utility>
 #include <cstdio>
@@ -41,6 +46,8 @@
 #include "vk_progress.h"   // (StartupView, version_text: the start-up screen)
 #include "vk_ui.h"
 #include "vk_menu_keys.h"   // (which gamepad buttons confirm and go back: those A and B are bound to)         // (how it looks: Dear ImGui, vk_imgui.h)
+#include "oot_teleport_capture.h"   // (hookshot: the Travel page's pictures)
+#include "oot_tp_places.h"   // (hookshot: the Travel page's places)
 #include "vk_dlss.h"
 #include "vk_framegen.h"   // (Frame generation by: who makes the frames now, framegen_maker)
 #include "vk_bug_report.h"   // (the Gameplay tab's Bug report: what it writes, and how)
@@ -233,6 +240,19 @@ const char* tx_upscaler(int) {
     // (by engine: DLAA and FSR 4's and XeSS's native AA are the Render resolution row's Native, upscaler_rows.h engine)
     return t[std::clamp(ur::engine(upscaler()), 0, ur::kUpscalers - 1)];
 }
+/// Why DLSS and DLAA do not run here (vk_dlss.h DlssWhy), for the Upscaler row and Frame generation by; nullptr for DLSS_OK
+const char* dlss_why_text(int why) {
+    static const char* const t[DLSS_WHY_COUNT] = {
+        nullptr,
+        "DLSS and DLAA: not in this build (built without NVIDIA's DLSS SDK, see the readme).",
+        "DLSS and DLAA: off for this run (RX_VK_DLSS=0).",
+        "DLSS and DLAA: need an NVIDIA RTX GPU.",
+        "DLSS and DLAA: need a newer NVIDIA driver.",
+        "DLSS and DLAA: DLSS's runtime was not found (the game folder's ngx folder, see the readme).",
+        "DLSS and DLAA: NVIDIA's NGX on Linux loads DLSS's runtime only from a folder named in ASCII (see the readme).",
+    };
+    return why > 0 && why < DLSS_WHY_COUNT ? t[why] : nullptr;
+}
 /// The Upscaler: the one shown (what runs, upscaler()), and with the game's own, why DLSS, FSR and XeSS are not offered.
 /// Variants (every one): each value, then the game's own with each of DLSS's reasons, then with each of FSR's, then XeSS's
 const char* hn_upscaler(int v, int variant) {
@@ -252,15 +272,6 @@ const char* hn_upscaler(int v, int variant) {
         "Intel's machine-learned upscaler, from a smaller 3D, with Intel's libxess.dll beside the game. Things that move by "
         "themselves can trail for now.",
         "Intel's machine-learned upscaler, the 3D at full size with its edges smoothed; the slowest.",
-    };
-    static const char* const dlss_no[DLSS_WHY_COUNT] = {
-        nullptr,
-        "DLSS and DLAA: not in this build (built without NVIDIA's DLSS SDK, see the readme).",
-        "DLSS and DLAA: off for this run (RX_VK_DLSS=0).",
-        "DLSS and DLAA: need an NVIDIA RTX GPU.",
-        "DLSS and DLAA: need a newer NVIDIA driver.",
-        "DLSS and DLAA: DLSS's runtime was not found (the game folder's ngx folder, see the readme).",
-        "DLSS and DLAA: NVIDIA's NGX on Linux loads DLSS's runtime only from a folder named in ASCII (see the readme).",
     };
     static const char* const fsr_no[FSR_WHY_COUNT] = {
         nullptr,
@@ -292,7 +303,7 @@ const char* hn_upscaler(int v, int variant) {
     v = std::clamp(v, 0, ur::kUpscalers - 1);
     // (the reasons are said only where the engine is in the build: one without FSR does not tell an NVIDIA user why, and a
     // Linux build does not tell anyone that XeSS is Windows only)
-    const char* dn = dlss_built() || variant >= 0 ? dlss_no[d] : nullptr;
+    const char* dn = dlss_built() || variant >= 0 ? dlss_why_text(d) : nullptr;
     const char* fn = fsr4_built() || variant >= 0 ? fsr_no[f] : nullptr;
     const char* xn = xess_built() || variant >= 0 ? xess_no[x] : nullptr;
     if (v != ur::GAME || (!dn && !fn && !xn)) return t[v];
@@ -301,7 +312,8 @@ const char* hn_upscaler(int v, int variant) {
              xn ? " " : "", xn ? xn : "");
     return b[d][f][x];
 }
-/// The DLSS model row (opts.dlss_model): NVIDIA's network by its preset, or RX_VK_DLSS_PRESET's for this run
+/// The DLSS model row (opts.dlss_model): NVIDIA's network by its preset (the K row's E on a card with less than 7 GB of video
+/// memory: upscaler_rows.h cnn_for_vram, as DLSS is made), or RX_VK_DLSS_PRESET's for this run
 const char* dlss_preset_env() {
     static const char* const e = getenv("RX_VK_DLSS_PRESET");
     return ur::preset_env(e) ? e : nullptr;
@@ -315,10 +327,11 @@ const char* tx_dlss_model(int v) {
         else snprintf(b, sizeof b, "NVIDIA default (RX_VK_DLSS_PRESET)");
         return b;
     }
+    if (ur::cnn_for_vram(v, device_vram_bytes())) return "CNN (E)";
     return t[std::clamp(v, 0, ur::kModels - 1)];
 }
-/// The DLSS model: the value chosen; variant 1: the game's own upscales (the row waits for DLSS or DLAA); variant 2: set for
-/// this run by RX_VK_DLSS_PRESET
+/// The DLSS model: the value chosen (the K row's on a card under 7 GB: why it is E); variant 1: the game's own upscales (the
+/// row waits for DLSS or DLAA); variant 2: set for this run by RX_VK_DLSS_PRESET
 const char* hn_dlss_model(int v, int variant) {
     static const char* const t[] = {
         "NVIDIA's transformer model: the one tested most here.",
@@ -328,9 +341,12 @@ const char* hn_dlss_model(int v, int variant) {
     };
     static const char* const unused = "Used by NVIDIA DLSS and DLAA: choose one in the Upscaler row.";
     static const char* const env = "Set for this run by RX_VK_DLSS_PRESET.";
+    static const char* const cnn = "NVIDIA's CNN model, chosen for graphics cards with less than 7 GB of memory: less video "
+                                   "memory and GPU time than the transformer.";
     if (variant < 0) variant = dlss_preset_env() ? 2 : upscaler() == ur::GAME || upscaler() == ur::OFF ? 1 : 0;
     if (variant == 1) return unused;
     if (variant == 2) return env;
+    if (variant == 0 && ur::cnn_for_vram(v, device_vram_bytes())) return cnn;
     return variant == 0 ? t[std::clamp(v, 0, ur::kModels - 1)] : nullptr;
 }
 /// The Game language row (opts.game_lang): language.txt's language, written once the row is left (game_lang_tick); the game
@@ -345,6 +361,13 @@ const char* hn_menu_lang(int v, int variant) {
     if (variant > 0) return nullptr;
     return v <= 0 ? "Follows the game's language (language.txt in the game folder)." : "The language of this menu.";
 }
+bool mic_testing = false; // session only, never saved or restored
+int mic_levels[2] = {}, mic_test_state = 0;
+constexpr const char* kMicLevelHelp =
+    "Shows microphone signal strength, not note recognition.\n\n"
+    "- First percentage: incoming peak before gain.\n"
+    "- Second percentage: peak after Microphone gain, also shown by the bar.\n\n"
+    "At 100% gain they match. Increasing gain also raises noise and can clip the signal.";
 const char* tx_percent(int v) {
     static char b[8];
     snprintf(b, sizeof b, "%d%%", v);
@@ -731,11 +754,18 @@ const char* hn_resolution(int v, int variant) {
     if (p == 100) return "The 3D at the output's full size: the sharpest, and the slowest.";
     return "A steady size: lower is faster, and softer.";
 }
+/// (hookshot) Whether the Frame generation by row offers DLSS FG: where DLSS-G can run in this process as far as is known
+/// (vk_dlss.cpp dlss_fg_unavailable). Where it cannot, the row has Built-in FG alone (row_fixed) and its line says why
+bool framegen_by_dlss_offered() { return dlss_fg_unavailable() == FG_SKIP_NONE; }
+/// Frame generation by with nothing to choose: DLSS FG cannot run (Built-in FG alone), or RX_VK_DLSS_FG=1 chooses DLSS FG
+/// for the run (vk_dlss.cpp dlss_fg_forced)
+bool framegen_by_fixed() { return !framegen_by_dlss_offered() || dlss_fg_forced(); }
 /// A row with nothing else to choose here: shown without its arrows, Left and Right leave it (and the saved value) alone
 bool row_fixed(const int* value) {
     return (value == &opts.dlss && ur::upscaler_fixed(upscalers_available())) ||
            (value == &opts.resolution && ur::render_fixed(upscaler())) || (value == &opts.upscale && !filter_needed()) ||
            (value == &opts.dlss_model && ur::model_fixed(upscaler(), dlss_preset_env() != nullptr)) ||
+           (value == &opts.framegen_by && framegen_by_fixed()) ||   // (its line says why)
            (value == &opts.astc_rgba8 && getenv("RX_VK_ASTC_RGBA8")) ||   // (set for the run: vk_texture.cpp reads it first)
            (value == &opts.intel_compiles && getenv("RX_VK_NO_INTEL_SERIAL"));
 }
@@ -826,6 +856,10 @@ const char* tx_prompts(int v) {
     static const char* t[HOS_PROMPT_N + 1] = {"Auto", "Switch", "Xbox", "PlayStation 4", "PlayStation 5", "Steam Deck",
                                               "Keyboard"};
     return t[std::min(std::max(v, 0), (int)HOS_PROMPT_N)];
+}
+const char* tx_cycle_items(int v) {   // (hookshot) the Cycle items row
+    static const char* t[] = {"Off", "Last used", "Basic", "+Bombs", "+Tools"};
+    return t[(unsigned)v < 5 ? v : 0];
 }
 const char* tx_gpu(int v) {
     static char buf[300];
@@ -1082,23 +1116,24 @@ const char* hn_framegen(int v, int variant) {
 }
 MENU_HINTS(hn_pace, 0, "As soon as it is ready.", "At an even interval: less stutter, at up to one frame of delay.")
 /// (hookshot) Who made the made frames lately (vk_framegen.cpp framegen_maker), with Frame generation on; nullptr: none made.
-/// One name each, "<engine> FG", on the Frame generation by row and the FPS counter alike
+/// One name each, "<engine> FG", on the Frame generation by row and the FPS counter alike; "DLSS FG paused" where DLSS FG
+/// showed the game's frames alone (the game's own menus: vk_dlss.cpp dlss_fg_holds)
 const char* framegen_maker_name() {
     if (opts.framegen < 1) return nullptr;
     switch (framegen_maker()) {
     case FgMaker::Dlss: return "DLSS FG";
     case FgMaker::Fsr3: return "FSR 3.1 FG";
     case FgMaker::BuiltIn: return "Built-in FG";
+    case FgMaker::DlssPaused: return "DLSS FG paused";
     default: return nullptr;
     }
 }
-/// Frame generation by: at Auto, who makes the frames now, so a player sees whether DLSS Frame Generation runs
+/// Frame generation by: the choice, DLSS FG (0) or Built-in FG (1); Built-in FG whatever is saved where DLSS FG cannot run,
+/// DLSS FG with RX_VK_DLSS_FG=1.
+/// Who makes the frames now (the game's own menus give DLSS-G nothing to make them from) is the row's line and the FPS
+/// counter's (framegen_maker_name), not the choice's name
 const char* tx_framegen_by(int v) {
-    const char* who = v ? nullptr : framegen_maker_name();
-    if (!who) return v ? "Built-in FG" : "Auto";
-    static char b[40];
-    snprintf(b, sizeof b, "Auto: %s", who);
-    return b;
+    return framegen_by_dlss_offered() && (v == 0 || dlss_fg_forced()) ? "DLSS FG" : "Built-in FG";
 }
 /// Why DLSS-G does not make the frames now (vk_dlss.h FgSkip, and the Auto multiplier's FG_SKIP_COUNT), the row's line after
 /// "Not DLSS FG now: ". most: its runtime's most made frames, for FG_SKIP_TOO_MANY
@@ -1124,31 +1159,71 @@ const char* framegen_skip_text(int why, unsigned most) {
     default: return nullptr;
     }
 }
-/// Its line: at Auto with another than DLSS-G making the frames, why ("Not DLSS FG now: " and framegen_skip_text). Variants
-/// (every one): Auto's, Built-in's, then "Not DLSS FG now: " with each reason
+/// Its line: the choice's. Where DLSS FG cannot run in this run, why, whatever is saved ("DLSS FG cannot run: " and
+/// framegen_skip_text, or for DLSS itself dlss_why_text: the log has NGX's own answer); with RX_VK_DLSS_FG=1, that it chooses.
+/// At DLSS FG with the game's frames alone now (its own menus, movies and loading screens draw no 3D to make frames from:
+/// vk_dlss.cpp dlss_fg_holds), that it is paused; with another making the frames now, why ("Not DLSS FG now: "). Variants
+/// (every one): the choice's; at DLSS FG "Not DLSS FG now: " with each reason, and the paused line; the switch's line; then
+/// "DLSS FG cannot run: " with each of its reasons
 const char* hn_framegen_by(int v, int variant) {
     static const char* const t[] = {
-        "NVIDIA DLSS Frame Generation where it runs (RTX 40 and newer, with the Upscaler's depth and motion), else the "
-        "built-in one.",
+        "NVIDIA DLSS Frame Generation (RTX 40 and newer), made from the Upscaler's depth and motion.",
         "The renderer's own: made from the finished picture alone.",
     };
-    if (v != 0) return variant <= 0 ? t[1] : nullptr;
-    static char b[FG_SKIP_COUNT + 2][400];
-    int why = FG_SKIP_NONE;
+    static const char* const paused = "DLSS FG paused: the game's own menus, movies and loading screens draw no 3D to make "
+                                      "frames from, so only the game's own frames show.";
+    // (dlss_fg_unavailable's reasons, each for the whole run; FG_SKIP_DEVICE with each of DLSS's own, dlss_why)
+    struct Cannot { int why, dlss; };
+    static const Cannot cannot[] = {{FG_SKIP_OFF, 0},
+                                    {FG_SKIP_DEVICE, DLSS_ENV_OFF},
+                                    {FG_SKIP_DEVICE, DLSS_NEEDS_RTX},
+                                    {FG_SKIP_DEVICE, DLSS_NEEDS_DRIVER},
+                                    {FG_SKIP_DEVICE, DLSS_NO_RUNTIME},
+                                    {FG_SKIP_DEVICE, DLSS_RUNTIME_NOT_ASCII},
+                                    {FG_SKIP_START, 0},
+                                    {FG_SKIP_REFUSED, 0},
+                                    {FG_SKIP_NOT_BUILT, 0}};
+    constexpr int kCannot = (int)(sizeof cannot / sizeof cannot[0]);
+    // (at DLSS FG: 1 .. FG_SKIP_COUNT each reason, FG_SKIP_COUNT the Auto multiplier's; then the paused line)
+    const int nows = v == 0 ? (int)FG_SKIP_COUNT + 1 : 0;
+    const int forced_at = nows + 1;   // (the switch's line; the reasons it cannot run after it)
+    static char b[FG_SKIP_COUNT + kCannot + 4][400];
+    int why = FG_SKIP_NONE, dlss = (int)DLSS_OK;
     unsigned most = 0;
+    bool off = false;      // (DLSS FG cannot run: not offered)
+    bool forced = false;   // (RX_VK_DLSS_FG=1 chooses)
     if (variant >= 0) {
-        if (variant == 0) return t[0];
-        why = variant;   // (1 .. FG_SKIP_COUNT: each reason, FG_SKIP_COUNT the Auto multiplier's)
-        if (why > FG_SKIP_COUNT) return nullptr;
+        if (variant == 0) return t[v == 0 ? 0 : 1];
+        if (variant < nows) why = variant;
+        else if (variant == nows) return paused;
+        else if (variant > forced_at && variant - forced_at <= kCannot) {
+            const Cannot& c = cannot[variant - forced_at - 1];
+            why = c.why, dlss = c.dlss, off = true;
+        } else if (variant == forced_at) {
+            forced = true;
+        } else {
+            return nullptr;
+        }
+    } else if ((why = dlss_fg_unavailable()) != FG_SKIP_NONE) {
+        off = true, dlss = (int)dlss_why();
+    } else if (dlss_fg_forced()) {
+        forced = true;
     } else {
+        if (v != 0) return t[1];
         const FgMaker m = opts.framegen >= 1 ? framegen_maker() : FgMaker::None;
+        if (m == FgMaker::DlssPaused) return paused;
         if (m != FgMaker::BuiltIn && m != FgMaker::Fsr3) return t[0];
         why = opts.framegen == 1 ? (int)FG_SKIP_COUNT : dlss_fg_skip(&most);
     }
-    const char* text = framegen_skip_text(why, most);
-    if (!text) return t[0];
-    char* out = b[variant >= 0 ? variant : FG_SKIP_COUNT + 1];
-    snprintf(out, sizeof b[0], "Not DLSS FG now: %s", text);
+    char* out = b[variant >= 0 ? variant : FG_SKIP_COUNT + kCannot + 3];
+    if (forced) {   // (as the V-Sync row's switches)
+        snprintf(out, sizeof b[0], "%s is set: it chooses for this run.", "RX_VK_DLSS_FG=1");
+        return out;
+    }
+    const char* text = off && why == FG_SKIP_DEVICE && dlss_why_text(dlss) ? dlss_why_text(dlss)
+                                                                          : framegen_skip_text(why, most);
+    if (!text) return t[v == 0 && !off ? 0 : 1];
+    snprintf(out, sizeof b[0], off ? "DLSS FG cannot run: %s" : "Not DLSS FG now: %s", text);
     return out;
 }
 const char* tx_vsync(int v) {
@@ -1296,6 +1371,12 @@ MENU_HINTS(hn_audio_output, 0, "5.1 when the selected/default output has 5.1 or 
            "Stereo, whatever the device has.", "5.1, whatever the device has. Mixed down on stereo speakers.",
            "The stereo average in both ears. Changes live on stereo output; restart from 5.1.")
 MENU_HINTS(hn_text_size, 0, "The game's original size.", "A little larger.", "Larger.", "Much larger.", "Largest.")
+MENU_HINTS(hn_item_wheel, 0, "R and L scroll the game's own item row.",
+           "Pages of 8 items, the same for the child and the adult. Y moves an item; Left/Right or the mouse wheel turn the page.")
+MENU_HINTS(hn_cycle_items, 0, "R and L open the item row (or the wheel) only.",
+           "A tap of R or L: the item that was on ZR before this one, whatever it is. Two taps: back again.",
+           "A tap of R or L: the next or previous arrow, bottle or spell on ZR.", "Basic, and the bombs and bombchus too.",
+           "+Bombs, and the hookshot, hammer, slingshot and boomerang too.")
 MENU_HINTS(hn_background, 0, "Only while the game's window has the focus.",
            "Also behind other windows, for streaming or other apps. The keyboard and mouse still need the game's window.")
 MENU_HINTS(hn_mousecam, 0, "The mouse stands in for the right stick, with its curve and top speed.",
@@ -1525,6 +1606,12 @@ Row rows[] = {
     {TAB_AUDIO, "Microphone", &opts.mic, 0, 2 + kMaxMics, 1, tx_mic,
      "What the ocarina hears when the game's microphone option is on (playing an instrument, or humming).", hn_mic, false,
      true},
+    {TAB_AUDIO, "Microphone gain", &opts.microphone_gain, 0, 400, 10, tx_percent,
+     "Adjust capture for Hookshot only; system volume is unchanged. Use the microphone test to see live levels while adjusting gain. "
+     "Changes apply to new samples.", nullptr, false, true},
+    {TAB_AUDIO, "Test microphone", nullptr, 0, 0, 0, nullptr,
+     "Start or stop microphone capture. No playback or audio files. You can adjust Microphone gain while testing. "
+     "Leaving Audio, closing the menu or selecting Off stops the test; the game can still use the mic."},
 
     // Gameplay, in sections (headings as the Graphics tab's: the selection steps over them). The last, System, is the
     // heading above Discord status, Bug report, Restart and Quit at the table's end
@@ -1540,6 +1627,10 @@ Row rows[] = {
     {TAB_GAMEPLAY, "Skip opening", &opts.skip_opening, 0, 1, 1, tx_onoff,
      "Skips the new-game opening (the story movie and Navi waking Link) and leaves later cutscenes, the Deku Tree "
      "meeting, and the title screen alone.", nullptr, false, true},
+    {TAB_GAMEPLAY, "Item wheel", &opts.item_wheel, 0, 1, 1, tx_onoff,   // (hookshot: host/oot_wheel.c, vk_wheel.cpp)
+     "Hold R or L for a wheel of your items: point at one with either stick and let go to equip it.", hn_item_wheel, false, true},
+    {TAB_GAMEPLAY, "Cycle items", &opts.cycle_items, 0, 4, 1, tx_cycle_items,
+     "Changes the item on ZR with a tap of R or L, within its group. Holding R or L still opens the row.", hn_cycle_items, false, true},
     {TAB_GAMEPLAY, "Text and language", nullptr, 0, 0, 0, nullptr, nullptr, nullptr, false, true, -1, true},
     {TAB_GAMEPLAY, "Text speed", &opts.text_speed, 0, 3, 1, tx_text_speed,
      "How fast the letters of dialogue and other messages appear.", hn_text_speed, false, true},
@@ -1615,6 +1706,11 @@ Row rows[] = {
      "count. The - and = keys change it in game too.", nullptr, false, true},
     {TAB_CONTROLS, "Invert mouse vertical", &opts.mouse_invert, 0, 1, 1, tx_onoff, "Swaps up and down for the mouse.",
      hn_mouse_invert, false, true},
+    // (with Mouse camera on Native the game's own camera inversion, which turns the right stick around, never reaches
+    // the mouse: this row is how its left and right are swapped, in both modes. No line about which way the camera
+    // then turns: As the stick turns it as the game turns it for the right stick, which need not be Native's way)
+    {TAB_CONTROLS, "Invert mouse horizontal", &opts.mouse_invert_x, 0, 1, 1, tx_onoff,
+     "Swaps left and right for the mouse.", nullptr, false, true},
     {TAB_CONTROLS, "Movement", nullptr, 0, 0, 0, nullptr, nullptr, nullptr, false, true, -1, true},
     {TAB_CONTROLS, "Auto run", &opts.auto_run, 0, 1, 1, tx_auto_run,
      "Sprint without holding A (or its key). Hold it until Link sprints, then let go: he keeps going. Let go of the "
@@ -1686,6 +1782,9 @@ Row rows[] = {
      "Move and look with your usual controls. Page Up / Page Down or R / L changes height.", nullptr, false, true, 7},
     {TAB_DEBUG, "Teleport", nullptr, 0, 0, 0, nullptr,
      "Opens the map list. Link travels through the game's own map change, in his current age.", nullptr, false, true, 8},
+    {TAB_DEBUG, "Travel", nullptr, 0, 0, 0, nullptr,
+     "Go to a place you know: villages, dungeons' entrances, shops, warps. Each with a picture from your own game, taken the "
+     "first time Link stays there a few seconds with the menu closed.", nullptr, false, true, 13},
     {TAB_DEBUG, "Switch age", nullptr, 0, 0, 0, nullptr,
      "Swaps Link between child and adult and reloads this map in the other age (the Market when this map has no match).", nullptr, false, true, 9},
     {TAB_DEBUG, "Inventory", nullptr, 0, 0, 0, nullptr,
@@ -1926,12 +2025,12 @@ bool age_shown(int i) { return i == 9 && link_age.load(std::memory_order_relaxed
 /// What confirm does on a tool's row, for its prompt (nullptr: nothing)
 const char* cheat_confirm(int i) {
     static const char* const says[kCheatRows] = {"Toggle", "Toggle", "Apply", "Apply", "Set", nullptr, "Apply", "Toggle", "Open list",
-                                                 "Switch", "Open", nullptr, "Apply", "Toggle"};
+                                                 "Switch", "Open", nullptr, "Apply", "Open"};
     return i >= 0 && i < kCheatRows ? says[i] : nullptr;
 }
 /// The button label on an action tool's row ("": not a button action)
 const char* cheat_button_text(int i) {
-    static const char* const buttons[kCheatRows] = {"", "", "Mark", "Return", "", "", "", "", "Choose map", "Switch", "Edit items", "", "", ""};
+    static const char* const buttons[kCheatRows] = {"", "", "Mark", "Return", "", "", "", "", "Choose map", "Switch", "Edit items", "", "", "Choose place"};
     return i >= 0 && i < kCheatRows ? buttons[i] : "";
 }
 constexpr int kRows = sizeof rows / sizeof rows[0];
@@ -2082,6 +2181,263 @@ std::atomic<bool> open_now{false};
 bool tune_mode = false;
 bool quick_debug = false;
 bool menu_refresh = false;
+
+// ---- (hookshot) the Travel page: the places of Link's age, grouped by area (gpu/vk/oot_tp_places.h), with a
+// picture of each, taken in play the first time Link stays a few seconds at the place (vk_replay.cpp teleport_capture). One
+// file a place in the game folder's teleport_pictures folder; nothing is shipped. The files are read and written by a worker
+// thread of their own (picture_worker), never by the replay's, the game's or the menu's: a picture is 389 KB, and a present
+// must not wait on a disk ----
+struct TeleportPicture {
+    uint32_t w = 0, h = 0;
+    std::vector<unsigned char> rgba;
+};
+std::map<std::string, TeleportPicture> teleport_captures;   // (by a place's key; std::map: its nodes stay put)
+std::map<std::string, int> teleport_files;   // (by key: 1 its file being read, 2 read: in teleport_captures, or none on disk)
+std::mutex teleport_captures_mu;   // (both maps: the worker's thread and the menu's)
+std::atomic<int> teleport_capture_want{-1};
+// (whether pictures are taken at all: only once the player has opened the Travel page, in this session or an earlier one (its
+// folder is there). A player who never opens it gets no files and no notice over the game)
+std::atomic<bool> travel_pictures_on{false};
+std::atomic<int> teleport_map_now{-1};   // (the place nearest Link, as the game side says)
+std::atomic<int64_t> notice_until{0};    // (a line over the game while the menu is closed: a picture taken, until then)
+char notice_text[128];
+/// A file in the game folder, or "" (logged) when unknown
+std::string game_folder_file(const char* name) {
+    char exe[MAX_PATH];
+    const DWORD n = game_module_path(exe, MAX_PATH);
+    const std::string path(exe, n && n < MAX_PATH ? n : 0);
+    const size_t slash = path.find_last_of("\\/");
+    if (slash == std::string::npos) {
+        logf("menu: no game folder for %s", name);
+        return "";
+    }
+    return path.substr(0, slash + 1) + name;
+}
+/// A picture's file, teleport_pictures/<key>.bin in the game folder, or "" when the folder is unknown
+std::string teleport_picture_path(const std::string& key) {
+    const std::string dir = game_folder_file("teleport_pictures");
+    return dir.empty() ? "" : dir + "/" + key + ".bin";
+}
+// A picture file: 'FTP2', width, height, then its RGB (no alpha: a picture is opaque). 480x270: 389 KB
+constexpr char kPictureMagic[4] = {'F', 'T', 'P', '2'};
+bool read_picture_file(const std::string& path, TeleportPicture& p) {
+    FILE* f = path.empty() ? nullptr : fopen(path.c_str(), "rb");
+    if (!f) return false;
+    char magic[4];
+    uint32_t wh[2];
+    bool ok = fread(magic, 1, 4, f) == 4 && !memcmp(magic, kPictureMagic, 4) && fread(wh, 4, 2, f) == 2 && wh[0] && wh[0] <= 2048 &&
+              wh[1] && wh[1] <= 2048;
+    std::vector<unsigned char> rgb;
+    if (ok) {
+        rgb.resize((size_t)wh[0] * wh[1] * 3);
+        ok = fread(rgb.data(), 1, rgb.size(), f) == rgb.size();
+    }
+    fclose(f);
+    if (!ok) {
+        logf("menu: %s is no Travel picture, left out", path.c_str());
+        return false;
+    }
+    p.w = wh[0], p.h = wh[1];
+    p.rgba.resize((size_t)p.w * p.h * 4);
+    for (size_t i = 0, n = (size_t)p.w * p.h; i < n; ++i)
+        p.rgba[i * 4] = rgb[i * 3], p.rgba[i * 4 + 1] = rgb[i * 3 + 1], p.rgba[i * 4 + 2] = rgb[i * 3 + 2], p.rgba[i * 4 + 3] = 255;
+    return true;
+}
+bool write_picture_file(const std::string& path, const TeleportPicture& p) {
+    if (path.empty()) return false;
+    std::error_code ec;
+    std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
+    std::vector<unsigned char> rgb((size_t)p.w * p.h * 3);
+    for (size_t i = 0, n = (size_t)p.w * p.h; i < n; ++i)
+        rgb[i * 3] = p.rgba[i * 4], rgb[i * 3 + 1] = p.rgba[i * 4 + 1], rgb[i * 3 + 2] = p.rgba[i * 4 + 2];
+    FILE* f = fopen((path + ".tmp").c_str(), "wb");
+    if (!f) return false;
+    const uint32_t wh[2] = {p.w, p.h};
+    fwrite(kPictureMagic, 1, 4, f), fwrite(wh, 4, 2, f), fwrite(rgb.data(), 1, rgb.size(), f);
+    bool ok = !ferror(f);
+    ok = fclose(f) == 0 && ok;
+    if (ok) std::filesystem::rename(path + ".tmp", path, ec);   // (over the old one, on either platform)
+    return ok && !ec;
+}
+// The worker's jobs: read a picture's file; Link has stayed near a place (its picture wanted when it has none, here or on
+// disk); keep and write a picture taken; forget one (the page's retake: taken again at the next stay there)
+struct PictureJob {
+    enum Kind { Read, Arrived, Store, Forget, Begin } kind = Read;   // (Begin: the page opened the first time, its folder made)
+    int place = -1;     // (Arrived, Store, Forget: a place of oot_tp_places)
+    std::string name;   // (Read: a place's key)
+    TeleportPicture pic;
+};
+std::mutex picture_jobs_mu;
+std::condition_variable picture_jobs_cv;
+std::deque<PictureJob> picture_jobs;
+/// The picture of this key read into teleport_captures when its file is there; whether it has one now. On the worker
+bool picture_read_now(const std::string& name) {
+    {
+        std::lock_guard lk(teleport_captures_mu);
+        if (teleport_captures.count(name)) return true;
+        if (teleport_files[name] == 2) return false;
+    }
+    TeleportPicture p;
+    const bool have = read_picture_file(teleport_picture_path(name), p);
+    std::lock_guard lk(teleport_captures_mu);
+    if (have && !teleport_captures.count(name)) teleport_captures[name] = std::move(p);
+    teleport_files[name] = 2;
+    return teleport_captures.count(name) != 0;
+}
+void picture_worker() {
+    for (;;) {
+        PictureJob j;
+        {
+            std::unique_lock lk(picture_jobs_mu);
+            picture_jobs_cv.wait(lk, [] { return !picture_jobs.empty(); });
+            j = std::move(picture_jobs.front());
+            picture_jobs.pop_front();
+        }
+        if (j.kind == PictureJob::Begin) {
+            std::error_code ec;
+            const std::string dir = game_folder_file("teleport_pictures");
+            if (!dir.empty()) std::filesystem::create_directories(dir, ec);
+            logf("menu: Travel pictures are taken from now on, in %s%s", dir.c_str(), ec ? " (the folder could not be made)" : "");
+        } else if (j.kind == PictureJob::Read) {
+            picture_read_now(j.name);
+            menu_refresh = true;   // (the page shows it now, if it is the chosen place's)
+        } else if (j.kind == PictureJob::Arrived) {
+            if (!picture_read_now(oot_tp_places[j.place].key)) teleport_capture_want.store(j.place, std::memory_order_relaxed);
+        } else if (j.kind == PictureJob::Forget) {
+            const OotTpPlace& place = oot_tp_places[j.place];
+            {
+                std::lock_guard lk(teleport_captures_mu);
+                teleport_captures.erase(place.key);
+                teleport_files[place.key] = 2;
+            }
+            std::error_code ec;
+            std::filesystem::remove(teleport_picture_path(place.key), ec);
+            logf("menu: Travel picture of %s (%s) forgotten: taken again at the next stay there", place.label, place.key);
+            menu_refresh = true;
+        } else {
+            const OotTpPlace& place = oot_tp_places[j.place];
+            for (size_t i = 3; i < j.pic.rgba.size(); i += 4) j.pic.rgba[i] = 255;   // (opaque, whatever the picture's alpha held)
+            const bool saved = write_picture_file(teleport_picture_path(place.key), j.pic);
+            int count;
+            {
+                std::lock_guard lk(teleport_captures_mu);
+                teleport_captures[place.key] = std::move(j.pic);
+                teleport_files[place.key] = 2;
+                count = (int)teleport_captures.size();
+            }
+            logf("menu: Travel picture of %s (%s) taken (%d in memory)%s", place.label, place.key, count, saved ? "" : "; not saved");
+            if (saved) {   // (the line over the game for 2.5 s)
+                snprintf(notice_text, sizeof notice_text, "Travel picture saved: %s", place.label);
+                                notice_until.store(prof_now() + 2500000000LL, std::memory_order_relaxed);
+            }
+        }
+    }
+}
+void picture_job(PictureJob&& j) {
+    static std::once_flag started;
+    std::call_once(started, [] { std::thread(picture_worker).detach(); });   // (it lives as long as the game)
+    {
+        std::lock_guard lk(picture_jobs_mu);
+        picture_jobs.push_back(std::move(j));
+    }
+    picture_jobs_cv.notify_one();
+}
+
+// the list: the places of one age by area (an area's heading is a line of its own, above its places)
+struct TravelList {
+    int adult = -1;
+    std::vector<int> place;               // (the shown places, in order: indices into oot_tp_places)
+    std::vector<TeleportSection> areas;   // (each area's title and first shown place)
+};
+TravelList travel;
+int travel_choice = 0;
+int travel_page_rows = 1;   // (as last drawn: the lines that fit, Page Up / Down)
+float travel_scroll_px = 0, travel_want_px = 0;   // (the list's scroll, eased toward travel_want_px)
+bool travel_follow = true;   // (the scroll follows the choice; the wheel lets go of it until the choice moves)
+int travel_wheel = 0;        // (the wheel's notches since the last drawing)
+int travel_pick = -1;   // (the age whose places the page lists, chosen with Tab or the top face button; -1 Link's own)
+ImTextureData* travel_tex = nullptr;   // (the chosen place's picture, as ImGui draws it: one texture, its pixels replaced)
+std::string travel_tex_key;            // (whose picture it holds)
+constexpr int kTravelPicW = 480, kTravelPicH = 270;
+/// The age whose places the page lists: the one chosen, else Link's as the game side says it (1 adult, else 0: unknown is the
+/// child's). Travelling to the other age's place makes Link that age, as the tools' Switch age does
+int travel_age() { return travel_pick >= 0 ? travel_pick : link_age.load(std::memory_order_relaxed) == 1 ? 1 : 0; }
+/// The list for the age now (made again when it changed)
+void travel_list() {
+    const int adult = travel_age();
+    if (travel.adult == adult) return;
+    travel = {};
+    travel.adult = adult;
+    for (const OotTpArea& a : oot_tp_areas) {
+        if (a.adult != adult) continue;
+        travel.areas.push_back({a.title, (int)travel.place.size()});
+        for (int i = a.first; i < a.first + a.count; i++) travel.place.push_back(i);
+    }
+    travel_choice = std::clamp(travel_choice, 0, std::max(0, (int)travel.place.size() - 1));
+    travel_follow = true;
+}
+int travel_area_of(int i) {
+    int area = 0;
+    while (area + 1 < (int)travel.areas.size() && i >= travel.areas[area + 1].first) ++area;
+    return area;
+}
+/// The chosen place's picture copied out (under the lock), and whether it has one; its file asked for once when not read yet
+bool travel_picture(int place, TeleportPicture* out, bool* reading) {
+    *reading = false;
+    if (place < 0 || place >= OOT_TP_PLACES) return false;
+    const std::string key = oot_tp_places[place].key;
+    std::lock_guard lk(teleport_captures_mu);
+    const auto it = teleport_captures.find(key);
+    if (it != teleport_captures.end()) {
+        *out = it->second;
+        return true;
+    }
+    int& state = teleport_files[key];
+    if (state == 2) return false;
+    *reading = true;
+    if (state == 0) {
+        state = 1;
+        PictureJob j;
+        j.kind = PictureJob::Read, j.name = key;
+        picture_job(std::move(j));
+    }
+    return false;
+}
+/// Whether a place has a picture, as far as the files read so far say (the list's mark)
+bool travel_has_picture(int place) {
+    std::lock_guard lk(teleport_captures_mu);
+    const std::string key = oot_tp_places[place].key;
+    if (teleport_captures.count(key)) return true;
+    int& state = teleport_files[key];
+    if (state == 0) {   // (asked for: the list marks it once it is read)
+        state = 1;
+        PictureJob j;
+        j.kind = PictureJob::Read, j.name = key;
+        picture_job(std::move(j));
+    }
+    return false;
+}
+/// The chosen place's picture as a texture ImGui draws (kTravelPicW x kTravelPicH, scaled to it), or null without one
+ImTextureData* travel_texture(int place) {
+    TeleportPicture pic;
+    bool reading = false;
+    if (!travel_picture(place, &pic, &reading) || !pic.w || !pic.h) return nullptr;
+    if (!travel_tex) travel_tex = ui::user_texture(kTravelPicW, kTravelPicH), travel_tex_key.clear();
+    const std::string key = oot_tp_places[place].key;
+    if (travel_tex_key != key) {   // (its pixels replaced: all of it uploaded again at the next drawing)
+        unsigned char* px = (unsigned char*)travel_tex->GetPixels();
+        for (int y = 0; y < kTravelPicH; y++)
+            for (int x = 0; x < kTravelPicW; x++) {
+                const unsigned char* q = &pic.rgba[((size_t)((uint64_t)y * pic.h / kTravelPicH) * pic.w + (uint64_t)x * pic.w / kTravelPicW) * 4];
+                unsigned char* d = px + ((size_t)y * kTravelPicW + x) * 4;
+                d[0] = q[0], d[1] = q[1], d[2] = q[2], d[3] = 255;
+            }
+        ui::user_texture_changed(travel_tex);
+        travel_tex_key = key;
+    }
+    return travel_tex;
+}
+
 // (a value too long for its row, a GPU's name: the selected row's slides through it, a character a step, resting at
 // each end; the other rows end it with "...". The drawing (fit) says how far it can slide, menu_tick moves it)
 int marquee_pos = 0, marquee_max = 0;
@@ -2092,9 +2448,9 @@ constexpr int64_t kMarqueeStep = 150000000LL, kMarqueeRest = 1200000000LL;   // 
 int hover_tab = -1;
 int drag_row = -1;
 bool mouse_read = false;   // (the menu has read the mouse since it opened)
-bool is_slider(const Row& r) { return r.value == &opts.sharpness || r.value == &opts.mouse_sens || r.value == &opts.gyro_sens_x || r.value == &opts.gyro_sens_y || r.value == &opts.volume || r.value == &opts.camera_speed || r.value == &opts.fov || r.value == &opts.gfx_foliage || r.value == &opts.gfx_objects || r.value == &opts.gfx_grass || r.value == &opts.gfx_shadows; }
+bool is_slider(const Row& r) { return !strcmp(r.name, "Microphone gain") || r.value == &opts.sharpness || r.value == &opts.mouse_sens || r.value == &opts.gyro_sens_x || r.value == &opts.gyro_sens_y || r.value == &opts.volume || r.value == &opts.camera_speed || r.value == &opts.fov || r.value == &opts.gfx_foliage || r.value == &opts.gfx_objects || r.value == &opts.gfx_grass || r.value == &opts.gfx_shadows; }
 /// (a scale: the arrows and a click stop at its ends; Rumble strength would go from Off to its strongest)
-bool stops_at_ends(const Row& r) { return r.value == &opts.ultrawide || r.value == &opts.mouse_sens || r.value == &opts.rumble || r.value == &opts.gyro_sens_x || r.value == &opts.gyro_sens_y || r.value == &opts.volume || r.value == &opts.camera_speed || r.value == &opts.fov || r.value == &opts.gfx_foliage || r.value == &opts.gfx_objects || r.value == &opts.gfx_grass || r.value == &opts.gfx_shadows; }
+bool stops_at_ends(const Row& r) { return !strcmp(r.name, "Microphone gain") || r.value == &opts.ultrawide || r.value == &opts.mouse_sens || r.value == &opts.rumble || r.value == &opts.gyro_sens_x || r.value == &opts.gyro_sens_y || r.value == &opts.volume || r.value == &opts.camera_speed || r.value == &opts.fov || r.value == &opts.gfx_foliage || r.value == &opts.gfx_objects || r.value == &opts.gfx_grass || r.value == &opts.gfx_shadows; }
 /// (the ini's Rumble strength on the menu's steps: 0 to 150, the nearest 25)
 int rumble_step(int v) { return (std::min(std::max(v, 0), 150) + 12) / 25 * 25; }
 // (hookshot) A run's environment over a saved row (RX_VK_PACE=1, HOS_OUTPUT_RES=...): for that run only. save() writes the
@@ -3150,8 +3506,8 @@ const std::vector<int>& bindable_keys() {
     }
     return k;
 }
-int page = 0;          // 0 the options, 1 the controls, 3 the teleport list, 4 the inventory, 5 the restart question (2: was the
-                       // debug tools' own page, now on the Debug tab)
+int page = 0;          // 0 the options, 1 the controls, 3 the teleport list, 4 the inventory, 5 the restart question, 6 the
+                       // Travel page (2: was the debug tools' own page, now on the Debug tab)
 int csel = 0, ccol = menu_hit::kCtlPrimary;   // the page's row (options, then bindings and reset) and binding column
 const int kTop = tab_row_count(TAB_PAGE);   // (Layout preset and Button prompts: a preset shows in the grid at once)
 int listening = 0;     // waiting for the new input: 1 a gamepad's, 2 a key
@@ -3215,6 +3571,33 @@ float banner_h(const ui::Ctx& c) { return std::max(58 * c.s, c.safe + 40 * c.s);
 
 /// (the Bug report's line under its help once saved, below: measure_help makes room for the longest)
 std::string bug_report_saved_text(const std::string& folder);
+bool mic_help_row(const Row& r) {
+    return r.tab == TAB_AUDIO && (!strcmp(r.name, "Test microphone") || !strcmp(r.name, "Microphone gain"));
+}
+std::string mic_help_text(const char* help) {
+    // Whole-string lookup: translate each complete paragraph before joining the shared explanation.
+    return std::string(help ? i18n::tr(help) : "") + "\n\n" + i18n::tr(kMicLevelHelp);
+}
+std::string mic_meter_label(int state, int incoming, int adjusted) {
+    if (!(state & 1)) return i18n::tr("Test stopped");
+    char text[64];
+    snprintf(text, sizeof text, "Testing: %d%% -> %d%%", std::clamp(incoming, 0, 1000) / 10, std::clamp(adjusted, 0, 1000) / 10);
+    return i18n::tr(text);
+}
+std::string mic_meter_status(int state) {
+    if (!(state & 1)) return i18n::tr("Test stopped");
+    std::string text = i18n::tr(!(state & 2) ? "Microphone unavailable" : !(state & 8) ? "Waiting for samples" :
+                              (state & 16) ? "Clipping" : "");
+    if (state & 4) text += i18n::tr(text.empty() ? "Default fallback" : " (Default fallback)");
+    return text;
+}
+float mic_meter_height(ui::Ctx& c, float width) {
+    float status = 0;
+    for (int state : {0, 1, 5, 3, 7, 11, 15, 27, 31})
+        status = std::max(status, ui::para(c, c.f.body, 16 * c.s, ImVec2(), 0, mic_meter_status(state).c_str(), width, false));
+    return 42 * c.s + 8 * c.s + status + 14 * c.s;
+}
+void mic_help_meter(ui::Ctx& c, ImVec2 a, ImVec2 b);
 /// The tallest help a row of the options can have, in pixels at width: its help and the tallest line any of its values can
 /// have: the help box keeps that height whichever row is selected and whatever its value
 float measure_help(ui::Ctx& c, float width) {
@@ -3230,7 +3613,12 @@ float measure_help(ui::Ctx& c, float width) {
         if (&r == &rows[kBugReportRow])   // (the Bug report's line once saved, with the longest folder name it can have)
             hint = ui::para(c, c.f.body, 16 * c.s, ImVec2(), 0, bug_report_saved_text("bug-reports/2026-12-31_23-59-59-99").c_str(),
                             width - 18 * c.s, false);
-        if (r.help) most = std::max(most, ui::para(c, c.f.body, 18 * c.s, ImVec2(), 0, r.help, width, false) + (hint ? 14 * c.s + hint : 0));
+        if (r.help) {
+            const bool mic = mic_help_row(r);
+            const std::string explanation = mic ? mic_help_text(r.help) : r.help;
+            most = std::max(most, ui::para(c, c.f.body, 18 * c.s, ImVec2(), 0, explanation.c_str(), width, false) +
+                                  (hint ? 14 * c.s + hint : 0) + (mic ? mic_meter_height(c, width) : 0));
+        }
     }
     return most;
 }
@@ -3305,19 +3693,30 @@ float title_banner(ui::Ctx& c, const char* title, const char* right) {
     if (right) ui::text_mid_right(c, c.f.body, 17 * s, c.w - c.safe, hh * 0.5f + s, ui::kBannerInk, right);
     return hh;
 }
+/// Keep translated microphone explanations readable in the available help area. Other help keeps its normal size.
+float mic_help_font_size(ui::Ctx& c, const char* help, float width, float height) {
+    for (float px = 18; px > 14; px -= 0.5f)
+        if (!help || ui::para(c, c.f.body, px * c.s, ImVec2(), 0, help, width, false) <= height) return px * c.s;
+    return 14 * c.s;
+}
 /// The help box from (x0, y0) to x1: a title, the help, a line set off by a bar, a gold line at its foot. min_h: its height at
 /// least (the tallest help the page can have, so it does not jump)
 void help_box(ui::Ctx& c, float x0, float x1, float y0, const char* title, const char* help, const char* hint, const char* gold_line,
-              float min_h = 0, bool after_restart = false, float y_min = 0, float y_max = FLT_MAX) {
+              float min_h = 0, bool after_restart = false, float y_min = 0, float y_max = FLT_MAX, bool microphone = false) {
     // (y_max: the box ends above it, the prompt strip's top: moved up as far as y_min (under the banner) when it is taller than
     // the room below y0, its reserved height (min_h) given up first, its text cut at its foot only if it still does not fit)
     const float s = c.s, w = x1 - x0 - 48 * s;
     // (return early if the box bounds collapsed: avoids zero-width or zero-height scissor clip rects)
     if (x1 <= x0 + 4 * s || y_max <= y_min + 4 * s) return;
-    const float th = help ? ui::para(c, c.f.body, 18 * s, ImVec2(), 0, help, w, false) : 0,
-                hh = hint ? ui::para(c, c.f.body, 16 * s, ImVec2(), 0, hint, w - 18 * s, false) : 0;
-    const float text_h = th + (hint ? 14 * s + hh : 0), note = after_restart ? 30 * s : 0;
+    const std::string explanation = microphone ? mic_help_text(help) : "";
+    if (microphone) help = explanation.c_str();
+    const float meter_h = microphone ? mic_meter_height(c, w) : 0;
+    const float hh = hint ? ui::para(c, c.f.body, 16 * s, ImVec2(), 0, hint, w - 18 * s, false) : 0;
+    const float note = after_restart ? 30 * s : 0;
     const float fixed = 22 * s + (title ? 32 * s : 0) + note + (gold_line ? 52 * s : 0) + 22 * s;
+    const float help_px = microphone ? mic_help_font_size(c, help, w, y_max - y_min - fixed - meter_h - (hint ? 14 * s + hh : 0)) : 18 * s;
+    const float th = help ? ui::para(c, c.f.body, help_px, ImVec2(), 0, help, w, false) : 0;
+    const float text_h = th + (hint ? 14 * s + hh : 0) + meter_h;
     float body = std::max(min_h, text_h);
     if (y0 + fixed + body > y_max) y0 = std::max(y_min, y_max - fixed - body);
     if (y0 + fixed + body > y_max) body = std::max(text_h, y_max - y0 - fixed);
@@ -3334,14 +3733,18 @@ void help_box(ui::Ctx& c, float x0, float x1, float y0, const char* title, const
         ui::text_mid(c, c.f.strong, 16 * s, x0 + 42 * s, y + 10 * s, ui::kGoldHi, "Takes effect after a restart");
         y += note;
     }
-    if (help) ui::para(c, c.f.body, 18 * s, ImVec2(x0 + 24 * s, y), ui::kInk, help, w);
+    if (microphone && mic_testing) {
+        mic_help_meter(c, ImVec2(x0 + 24 * s, y), ImVec2(x1 - 24 * s, y + 42 * s));
+        y += meter_h;
+    }
+    if (help) ui::para(c, c.f.body, help_px, ImVec2(x0 + 24 * s, y), ui::kInk, help, w);
     if (hint) {
         const float hy = y + th + 14 * s;
         c.d->AddRectFilled(ImVec2(x0 + 24 * s, hy + 2 * s), ImVec2(x0 + 26.5f * s, hy + hh - 2 * s), ui::kAccent, s);
         ui::para(c, c.f.body, 16 * s, ImVec2(x0 + 40 * s, hy), ui::kSoft, hint, w - 18 * s);
     }
     if (gold_line) {
-        y += body + 20 * s;
+        y = y0 + 22 * s + (title ? 32 * s : 0) + note + body + 20 * s;
         c.d->AddLine(ImVec2(x0 + 24 * s, y), ImVec2(x1 - 24 * s, y), ui::alpha(ui::kEdge, 0.8f), std::max(1.0f, s));
         ui::diamond(c, ImVec2(x0 + 29 * s, y + 20 * s), 4 * s, ui::kGoldHi);
         ui::text_mid(c, c.f.strong, 16 * s, x0 + 42 * s, y + 20 * s, ui::kGoldHi, gold_line);
@@ -3408,8 +3811,8 @@ void halves_cell(ui::Ctx& c, ImVec2 a, ImVec2 b, const char* lo, const char* hi,
     ui::text_mid_centre(c, high ? c.f.strong : c.f.body, px, (xm + b.x) * 0.5f, mid, high ? on : ui::kDim, hi);
     if (sel) ui::glow(c, a, b);
 }
-/// A slider's value cell: the value, a track with its knob along the cell's foot; *t0, *t1 the track (for the mouse)
-void slider_cell(ui::Ctx& c, ImVec2 a, ImVec2 b, const char* value, int permille, bool sel, float* t0, float* t1) {
+/// A slider's value cell; a display-only meter omits adjustment arrows and mouse track bounds.
+void slider_cell(ui::Ctx& c, ImVec2 a, ImVec2 b, const char* value, int permille, bool sel, float* t0, float* t1, bool adjustable = true) {
     const float s = c.s, mid = (a.y + b.y) * 0.5f, in = 4 * s, px = 18 * s;
     c.d->AddRectFilled(a, b, ui::kCellDark);
     c.d->AddRect(a, b, ui::kEdge, 0, std::max(1.0f, s));
@@ -3420,10 +3823,20 @@ void slider_cell(ui::Ctx& c, ImVec2 a, ImVec2 b, const char* value, int permille
     c.d->AddRectFilled(ImVec2(x0, ty - 1.5f * s), ImVec2(xv, ty + 1.5f * s), done, 1.5f * s);
     ui::diamond(c, ImVec2(xv, ty), 4.5f * s, done);
     ui::text_mid_centre(c, c.f.strong, px, (a.x + b.x) * 0.5f, mid - 3 * s, sel ? ui::kGoldInk : ui::kInk, value);
-    const ImU32 arrow = sel ? ui::kGoldInk : ui::kDim;
-    ui::triangle(c, ImVec2(a.x + in + 11 * s, mid), 9 * s, 0, arrow), ui::triangle(c, ImVec2(b.x - in - 11 * s, mid), 9 * s, 1, arrow);
+    if (adjustable) {
+        const ImU32 arrow = sel ? ui::kGoldInk : ui::kDim;
+        ui::triangle(c, ImVec2(a.x + in + 11 * s, mid), 9 * s, 0, arrow), ui::triangle(c, ImVec2(b.x - in - 11 * s, mid), 9 * s, 1, arrow);
+    }
     if (sel) ui::glow(c, a, b);
-    *t0 = x0, *t1 = x1;
+    *t0 = adjustable ? x0 : 0, *t1 = adjustable ? x1 : 0;
+}
+/// Read-only live meter in help, with no mouse-hit registration or adjustment arrows.
+void mic_help_meter(ui::Ctx& c, ImVec2 a, ImVec2 b) {
+    const std::string label = mic_meter_label(mic_test_state, mic_levels[0], mic_levels[1]);
+    const std::string status = mic_meter_status(mic_test_state);
+    float unused0 = 0, unused1 = 0;
+    slider_cell(c, a, b, label.c_str(), std::clamp(mic_levels[1], 0, 1000), false, &unused0, &unused1, false);
+    if (!status.empty()) ui::para(c, c.f.body, 16 * c.s, ImVec2(a.x, b.y + 8 * c.s), ui::kSoft, status.c_str(), b.x - a.x);
 }
 /// (hookshot) A text field's value cell: its text from the left (cut with "..." when too long); empty, the placeholder, dim.
 /// While it has the keyboard (typing): light text on the dark cell inside a gold frame, a steady caret at its place, the text slid
@@ -3476,8 +3889,8 @@ std::string restart_line(ui::Ctx& c, float px, float width) {
 /// and Change quantity are not shown (the Inventory page edits every amount)
 struct DebugGroup { const char* title; int from, to; };   // (debug_tools_order[from, to))
 // (-1 is the saved Damage taken option, not a cheat action: beside Heart protection in Player)
-constexpr int debug_tools_order[] = {0, -1, 1, 11, 13, 9, 10, 12, 8, 2, 3, 7, 4};
-constexpr DebugGroup debug_groups[] = {{"Player", 0, 8}, {"Travel", 8, 11}, {"Camera & world", 11, 13}};
+constexpr int debug_tools_order[] = {0, -1, 1, 11, 9, 10, 12, 8, 13, 2, 3, 7, 4};
+constexpr DebugGroup debug_groups[] = {{"Player", 0, 7}, {"Travel", 7, 11}, {"Camera & world", 11, 13}};
 constexpr int kDebugGroups = sizeof debug_groups / sizeof debug_groups[0];
 constexpr int kDebugGeneralRows = 2;
 constexpr int kDebugTools = sizeof debug_tools_order / sizeof debug_tools_order[0];
@@ -3635,26 +4048,25 @@ void draw_debug_rows(ui::Ctx& c, float cx0, float cx1, float top, float bottom, 
 // change the live options the renderer reads. Keep their current values, but do
 // not call them changes or invent a default. GPU 0 and microphone 1 stay stable;
 // report_default has the Aspect ratio's, the Game language's and Frame generation by's.
+// The DLSS model's depends on RX_VK_DLSS_PRESET, and on the card's memory (CNN (E) under 7 GB).
 bool report_default_depends_on_pc(const Row& r) {
     if (r.value == &opts.sharpness || r.value == &opts.pace || r.value == &opts.realtime ||
         r.value == &opts.handheld)
         return opts.preset != 0 || auto_for != 0;
     return r.value == &opts.output_res || r.value == &opts.resolution || r.value == &opts.dlss ||
            r.value == &opts.preset || r.value == &opts.upscale ||
-           (r.value == &opts.dlss_model && dlss_preset_env());
+           (r.value == &opts.dlss_model && (dlss_preset_env() || ur::cnn_for_vram(ur::MODEL_K, device_vram_bytes())));
 }
 // The report's default for row r: the default options' value (fixed), or the one the
 // menu knows better. The Aspect ratio's is the monitor's shape, as outputs_sync makes
 // it from the default Output resolution and ultrawide=1; the Game language's is
-// language.txt's, else the first (README). *named: the default as the row names it,
-// where the row's own text shows the live state (Frame generation by at Auto: who
-// makes the frames now), else nullptr.
-int report_default(const Row& r, int fixed, const char** named) {
+// language.txt's, else the first (README). Frame generation by with nothing to
+// choose (framegen_by_fixed) is the run's, whatever is saved: no change of the player's.
+int report_default(const Row& r, int fixed) {
     static const Options defaults{};
-    *named = nullptr;
     if (r.value == &opts.ultrawide) return aspect_of_choice(defaults.output_res, defaults.ultrawide);
     if (r.value == &opts.game_lang) return i18n::game_lang_index();
-    if (r.value == &opts.framegen_by) *named = "Auto";
+    if (r.value == &opts.framegen_by && framegen_by_fixed()) return *r.value;
     return fixed;
 }
 // (hookshot) the Gameplay tab's Bug report: the rows not at their defaults, as the menu shows them, for its "Changes from the
@@ -3666,8 +4078,7 @@ std::string changed_rows_text(std::string& pc_options) {
     for (const Row& r : rows) {
         const char* at = (const char*)r.value;
         if (!r.value || !r.text || r.heading || at < (const char*)&opts || at >= (const char*)(&opts + 1)) continue;
-        const char* named = nullptr;
-        const int was = report_default(r, *(const int*)((const char*)&defaults + (at - (const char*)&opts)), &named);
+        const int was = report_default(r, *(const int*)((const char*)&defaults + (at - (const char*)&opts)));
         const bool depends = report_default_depends_on_pc(r);
         if (!depends && *r.value == was) continue;
         std::string& to = depends ? pc_options : out;
@@ -3676,7 +4087,7 @@ std::string changed_rows_text(std::string& pc_options) {
         // (a microphone chosen by its name, not the name: a device's name can be a person's)
         to += r.value == &opts.mic && *r.value >= 2 ? "a microphone by its name" : r.text(*r.value);
         to += depends ? " (default depends on this PC" : " (default: ";
-        if (!depends) to += named ? named : r.text(was);
+        if (!depends) to += r.text(was);
         if (restart_changed(r)) to += "; takes effect after a restart";
         to += ")\n";
     }
@@ -3750,7 +4161,9 @@ void row_value_cell(ui::Ctx& c, const Row& r, ImVec2 va, ImVec2 vb, bool selecte
     } else if (const FieldRow* f = field_row(r)) {
         text_cell(c, va, vb, *f->field, selected, editing == f->field, "None");
     } else if (!r.value) {
-        if (pending == &r) choice_cell(c, va, vb, "Press again to confirm", selected, false, false);
+        if (!strcmp(r.name, "Test microphone"))
+            choice_cell(c, va, vb, !host || !host->mic_test ? "Unavailable" : opts.mic == 0 ? "Microphone Off" : mic_testing ? "Stop test" : "Start test", selected, false, false);
+        else if (pending == &r) choice_cell(c, va, vb, "Press again to confirm", selected, false, false);
         else if (is_share_row(r)) choice_cell(c, va, vb, share_value.empty() ? "Save" : share_value, selected, false, false);   // (an action, not a page)
         else if (&r == &rows[kBugReportRow]) choice_cell(c, va, vb, bug_report_cell(), selected, false, false);   // (how the last report went)
         else {
@@ -3971,6 +4384,7 @@ void draw_options(ui::Ctx& c) {
     }
     const int count = tab_row_count(cur_tab), sel = tab_selected[cur_tab];
     const Row& selr = rows[tab_row_to_global(cur_tab, sel)];
+    const bool mic_help = mic_help_row(selr);
     const FieldRow* field = field_row(selr);   // (hookshot: a text field: why Enter did not take it, while it is edited)
     const char* hint = selr.value && selr.hint ? selr.hint(*selr.value, -1) : field && editing == field->field ? edit_why : nullptr;
     if (is_share_row(selr) && !share_said.empty()) hint = share_said.c_str();   // (what the last save did)
@@ -4017,17 +4431,18 @@ void draw_options(ui::Ctx& c) {
     float bottom = std::min(c.h - c.safe, bar_top) - 10 * s;   // (the rows end above the prompts)
     const bool after = restart_changed(selr);
     const float rh = 40 * s, pitch = 48 * s, top = hh + 24 * s, rx0 = cx0 + 44 * s, rx1 = cx1 - 44 * s, split = rx0 + (rx1 - rx0) * 0.55f;
-    if (narrow) {   // (the help over the column's foot, the rows above it: at most half the room, the rows get the rest)
+    if (narrow) {   // (the help over the column's foot, the rows above it: at most half the room (65% for the mic meter and
+                    // its explanation), the rows get the rest)
         // (bound help height so it leaves room for at least one row above it)
-        const float max_help = std::max(0.0f, (bottom - top - rh - 16 * s) * 0.5f);
+        const float max_help = std::max(0.0f, (bottom - top - rh - 16 * s) * (mic_help ? 0.65f : 0.5f));
         const float help_h = std::min(22 * s + 32 * s + help_tall + (after ? 30 * s : 0) + (pending_line.empty() ? 0 : 52 * s) + 22 * s,
                                       max_help);
         bottom = std::min(bar_top, c.h - c.safe) - help_h - 16 * s;
         help_box(c, hx0, hx1, bottom + 8 * s, selr.name, selr.help, hint, pending_line.empty() ? nullptr : pending_line.c_str(), help_tall,
-                 after, bottom + 8 * s, bar_top - 10 * s);
+                 after, bottom + 8 * s, bar_top - 10 * s, mic_help);
     } else {
         help_box(c, hx0, hx1, std::max(hh + 26 * s, c.h * 0.30f), selr.name, selr.help, hint,
-                 pending_line.empty() ? nullptr : pending_line.c_str(), help_tall, after, hh + 18 * s, bar_top - 12 * s);
+                 pending_line.empty() ? nullptr : pending_line.c_str(), help_tall, after, hh + 18 * s, bar_top - 12 * s, mic_help);
     }
     // (guarantee bottom stays at or below top + rh so scroll_rows and PushClipRect never receive an inverted range)
     bottom = std::max(bottom, top + rh);
@@ -4525,6 +4940,147 @@ void draw_teleport(ui::Ctx& c) {
     ui::prompt_bar(c, prompts, 5);   // (the prompts, on top of the help and the cards)
 }
 
+/// (hookshot) The Travel page (page 6): the places of one age by area in the column, the chosen place's picture, name and area
+/// beside it (over the column's foot on a narrow window: the picture left out), Travel below
+void draw_travel(ui::Ctx& c) {
+    const float s = c.s;
+    travel_list();
+    const int n = (int)travel.place.size(), areas = (int)travel.areas.size();
+    int with = 0;
+    for (int i = 0; i < n; i++) with += travel_has_picture(travel.place[i]);
+    char count[64];
+    snprintf(count, sizeof count, "%d of %d · %d with pictures", n ? travel_choice + 1 : 0, n, with);
+    const float hh = title_banner(c, "Travel", count);
+    float cx0, cx1, hx0, hx1;
+    bool narrow;
+    columns(c, &cx0, &cx1, &hx0, &hx1, &narrow);
+    column(c, cx0, cx1, hh);
+    const ui::Prompt prompts[] = {{ui::kUpDown, "Move"}, {ui::kTabs, "Area"}, {ui::kKey, "Child / Adult", "Tab"},
+        {ui::kConfirm, "Travel"}, {ui::kKey, "Retake picture", "Bksp"}, {ui::kBack, "Back"}};
+    const float bar = ui::prompt_bar_top(c);
+    const float left = cx0 + 24 * s, right = cx1 - 24 * s;
+    // (the ages, at the column's top: the one listed lit; a click on the other lists its places)
+    const float ay = hh + 14 * s, ah = 34 * s;
+    {
+        const char* const ages[2] = {"Child", "Adult"};
+        float x = left;
+        for (int a = 0; a < 2; a++) {
+            const float bw = ui::size_of(c.f.strong, 18 * s, ages[a]).x + 44 * s;
+            ui::button(c, ImVec2(x, ay), ImVec2(x + bw, ay + ah), ages[a], a == travel.adult);
+            hits.add(x, ay, x + bw, ay + ah, menu_hit::kButton, 10 + a);
+            x += bw + 10 * s;
+        }
+        const int now = link_age.load(std::memory_order_relaxed);
+        if (now >= 0 && now != travel.adult)
+            ui::text_mid(c, c.f.body, 15 * s, x + 8 * s, ay + ah * 0.5f, ui::kAccent, "Link becomes this age");
+    }
+    const float top = ay + ah + 14 * s;
+    const float strip = 58 * s, detail = bar - 14 * s - strip;
+    const float bottom = std::max(top, detail - 6 * s), pitch = 40 * s, head = 38 * s;
+    // (the y of each line from the list's top: an area's heading, then its places)
+    std::vector<float> area_y(areas + 1);
+    float total = 0;
+    for (int k = 0; k < areas; ++k) {
+        area_y[k] = total;
+        const int end = k + 1 < areas ? travel.areas[k + 1].first : n;
+        total += head + (end - travel.areas[k].first) * pitch;
+    }
+    area_y[areas] = total;
+    auto line_y = [&](int i) { const int k = travel_area_of(i); return area_y[k] + head + (i - travel.areas[k].first) * pitch; };
+    const float view = bottom - top;
+    travel_page_rows = std::max(1, (int)(view / pitch) - 1);
+    float& at = travel_scroll_px;
+    float& want = travel_want_px;
+    if (travel_wheel) want -= travel_wheel * pitch, travel_wheel = 0;
+    if (total <= view) want = 0;
+    else if (!travel_follow) want = std::clamp(want, 0.0f, total - view);
+    else if (n) {
+        const int k = travel_area_of(travel_choice);
+        const float y0 = travel_choice == travel.areas[k].first ? area_y[k] : line_y(travel_choice) - pitch * 0.5f;
+        const float y1 = line_y(travel_choice) + pitch * 1.5f;
+        if (y0 < want) want = y0;
+        if (y1 > want + view) want = y1 - view;
+        want = std::clamp(want, 0.0f, total - view);
+    }
+    at += (want - at) * ease_step;
+    if (std::fabs(want - at) < 0.5f) at = want;
+    if (total > view) scroll_bar(c, cx0 + 12 * s, top, bottom, (int)total, (int)view, at);
+    c.d->PushClipRect(ImVec2(left - 12 * s, top), ImVec2(right + 12 * s, bottom), true);
+    for (int k = 0; k < areas; ++k) {
+        const float hy = top + area_y[k] - at + head * 0.5f;
+        if (hy > bottom + head || hy < top - head) continue;
+        ui::text_mid(c, c.f.heading, 19 * s, left, hy, ui::kInkBright, travel.areas[k].name);
+        const float tw = ui::size_of(c.f.heading, 19 * s, travel.areas[k].name).x;
+        c.d->AddLine(ImVec2(left + tw + 14 * s, hy + s), ImVec2(right, hy + s), ui::alpha(ui::kAccent, 0.45f), std::max(1.0f, s));
+    }
+    for (int i = 0; i < n; ++i) {
+        const ImVec2 a(left, top + line_y(i) - at), b(right, a.y + pitch - 6 * s);
+        if (b.y < top || a.y > bottom) continue;
+        const bool selected = i == travel_choice;
+        c.d->AddRectFilled(a, b, selected ? ui::kCellNameSel : ui::kCellName, 3 * s);
+        c.d->AddRect(a, b, ui::kEdge, 3 * s, std::max(1.0f, s));
+        if (selected) c.d->AddRectFilled(a, ImVec2(a.x + 4 * s, b.y), ui::kGoldHi);
+        const float mid = (a.y + b.y) * 0.5f;
+        if (travel_has_picture(travel.place[i]))   // (a small square: this place has its picture)
+            c.d->AddRectFilled(ImVec2(b.x - 22 * s, mid - 4 * s), ImVec2(b.x - 14 * s, mid + 4 * s), selected ? ui::kGoldHi : ui::kAccent, s);
+        c.d->PushClipRect(a, ImVec2(b.x - 30 * s, b.y), true);
+        ui::text_mid(c, selected ? c.f.strong : c.f.body, 17 * s, a.x + 16 * s, mid, selected ? ui::kInkBright : ui::kInk,
+                     oot_tp_places[travel.place[i]].label);
+        c.d->PopClipRect();
+        if (selected) ui::glow(c, a, b);
+        hits.add(a.x, std::max(a.y, top), b.x, std::min(b.y, bottom), menu_hit::kListLine, i);
+    }
+    c.d->PopClipRect();
+    const int place = n ? travel.place[travel_choice] : -1;
+    const char* area = n ? travel.areas[travel_area_of(travel_choice)].name : "";
+    if (!narrow && place >= 0) {   // (beside the column: the picture, or how one comes, and what Travel does)
+        const float pw = hx1 - hx0, ph = pw * 9.0f / 16.0f, py = hh + 18 * s;
+        const ImVec2 pa(hx0, py), pb(hx1, py + ph);
+        ui::box(c, pa, pb);
+        bool reading = false;
+        TeleportPicture none;
+        if (ImTextureData* tex = travel_texture(place)) c.d->AddImage(tex->GetTexRef(), pa + ImVec2(2 * s, 2 * s), pb - ImVec2(2 * s, 2 * s));
+        else {
+            travel_picture(place, &none, &reading);
+            const float cy = (pa.y + pb.y) * 0.5f;
+            ui::text_mid_centre(c, c.f.strong, 17 * s, (pa.x + pb.x) * 0.5f, cy - 12 * s, ui::kSoft, reading ? "Reading the picture..." : "No picture yet");
+            if (!reading)
+                ui::text_mid_centre(c, c.f.body, 15 * s, (pa.x + pb.x) * 0.5f, cy + 14 * s, ui::kDim, "Stay here a few seconds with the menu closed");
+        }
+        help_box(c, hx0, hx1, pb.y + 14 * s, oot_tp_places[place].label,
+                 "Link arrives through the game's own map change, as when he walks in. A small square in the list marks a place "
+                 "with a picture; Backspace takes this one again at the next stay there.",
+                 area, nullptr, 0, false, pb.y + 10 * s, bar - 12 * s);
+    }
+    if (detail >= top && place >= 0) {   // (the choice, its area and age, and Travel: what Enter does)
+        c.d->AddLine(ImVec2(left, detail), ImVec2(right, detail), ui::alpha(ui::kEdge, 0.8f));
+        const float my = detail + strip * 0.5f + 2 * s;
+        const float bw = ui::size_of(c.f.strong, 20 * s, "Travel").x + 56 * s;
+        const ImVec2 a(right - bw, my - 18 * s), b(right, my + 18 * s);
+        c.d->PushClipRect(ImVec2(left, detail), ImVec2(a.x - 12 * s, detail + strip), true);
+        ui::text_mid(c, c.f.strong, 18 * s, left, my - 10 * s, ui::kInkBright, oot_tp_places[place].label);
+        char where[96];
+        snprintf(where, sizeof where, "%s · %s", area, travel.adult ? "adult" : "child");
+        ui::text_mid(c, c.f.body, 15 * s, left, my + 12 * s, ui::kAccent, where);
+        c.d->PopClipRect();
+        ui::button(c, a, b, "Travel", false);
+        hits.add(a.x, a.y, b.x, b.y, menu_hit::kButton, 0);
+    }
+    ui::prompt_bar(c, prompts, 6);
+}
+
+/// (hookshot) Over the game, the menu closed: "Travel picture saved: <place>" for a moment, low in the middle (the HUD keeps
+/// its corners)
+void draw_travel_notice(ui::Ctx& c) {
+    const float s = c.s;
+    const float tw = ui::size_of(c.f.strong, 17 * s, notice_text).x, w = tw + 48 * s, h = 40 * s;
+    const ImVec2 a((c.w - w) * 0.5f, c.h - h - 64 * s), b(a.x + w, a.y + h);
+    c.d->AddRectFilled(a, b, ui::kCellDark, 4 * s);
+    c.d->AddRect(a, b, ui::kEdge, 4 * s, std::max(1.0f, s));
+    c.d->AddRectFilled(a, ImVec2(b.x, a.y + 2 * s), ui::kGoldHi);
+    ui::text_mid_centre(c, c.f.strong, 17 * s, (a.x + b.x) * 0.5f, (a.y + b.y) * 0.5f + s, ui::kInkBright, notice_text);
+}
+
 void draw_quick_debug(ui::Ctx& c) {
     const float s = c.s, width = std::min(1040 * s, c.w - 2 * c.safe);
     const float left = (c.w - width) * .5f, right = left + width;
@@ -4645,6 +5201,7 @@ void draw_menu(ui::Ctx& c) {
     else if (page == 5) draw_ask(k);
     else if (page == 1) draw_controls(k);
     else if (page == 3) draw_teleport(k);
+    else if (page == 6) draw_travel(k);
     else if (page == 4) draw_inventory(k);
     else if (quick_debug && cur_tab == TAB_DEBUG) draw_quick_debug(k);
     else if (tune_mode) draw_tune_bar(k);
@@ -5205,6 +5762,7 @@ static void probe_upscalers_soon() {
         std::thread([] {
             const auto t0 = std::chrono::steady_clock::now();
             dlss_probe();
+            dlss_fg_probe();   // (after DLSS's own answer: whether the Frame generation by row offers DLSS FG)
             fsr4_probe();
             xess_probe();
             (void)fsr3::supported();
@@ -5475,7 +6033,16 @@ bool intel_compiles_side_by_side() {   // (RX_VK_NO_INTEL_SERIAL in the row: men
 bool intel_quick_compute() { return opts.intel_quick != 0 && intel_compiler_row(); }   // (RX_VK_COMPUTE_QUICK_FIRST in it: menu_init)
 bool resolution_auto() { return opts.resolution == 0; }
 int resolution_scale() {
-    const float s = upscaler_rows::percent(ur::snap_render(upscaler(), opts.resolution)) / 100.0f;
+    const int drawn = ur::snap_render(upscaler(), opts.resolution);
+    {   // (said when it changes: the choice kept and what the Upscaler shown draws at, e.g. 58% kept, 50% drawn by the game's own)
+        static int said = -1;
+        if (said != drawn * 16 + opts.resolution) {
+            said = drawn * 16 + opts.resolution;
+            logf("vk: Render resolution: %d%% chosen, drawn at %d%% with Upscaler %d", upscaler_rows::percent(opts.resolution),
+                 upscaler_rows::percent(drawn), upscaler());
+        }
+    }
+    const float s = upscaler_rows::percent(drawn) / 100.0f;
     return s > 0 ? (int)(twelfths(s) * 10000.0f / 12.0f + 0.5f) : 0;   // (the twelfth game_size labels)
 }
 
@@ -5505,6 +6072,22 @@ void menu_set_gpu_count(int count) {
 }
 
 bool menu_is_open() { return open_now.load(std::memory_order_relaxed); }
+int menu_take_capture_request() {   // (hookshot: not while the menu covers the picture)
+    const int want = teleport_capture_want.exchange(-1, std::memory_order_relaxed);
+    return open_now.load(std::memory_order_relaxed) ? -1 : want;
+}
+/// (hookshot) The replay's thread, at a present: the picture's pixels copied and handed to the picture worker, which keeps and
+/// writes them. No file is touched here
+void menu_store_capture(int place, const uint8_t* rgba, uint32_t w, uint32_t h) {
+    if (place < 0 || place >= OOT_TP_PLACES) return;
+    PictureJob j;
+    j.kind = PictureJob::Store, j.place = place;
+    j.pic.w = w, j.pic.h = h;
+    j.pic.rgba.assign(rgba, rgba + (size_t)w * h * 4);
+    picture_job(std::move(j));
+}
+// (hookshot: only while the tools are on, and once the page was opened)
+bool menu_teleport_captures_on() { return cheats_on() && travel_pictures_on.load(std::memory_order_relaxed); }
 bool scene_tonemap_on() { return dev.hdr && opts.hdr == 2 && opts.hdr_tonemap == 1; }
 // (the tools off on the Debug tab: flight, the free camera and heart protection put away; -1, heart protection never set, is the
 // host's own HOS_OOT_PROTECT_HEARTS)
@@ -5639,13 +6222,25 @@ bool fps_take(int64_t now, int64_t shown, int64_t game, int64_t* next, int64_t* 
 // (the game's) and the control bridge's menu_setting and menu_setting_set (its own thread). Recursive: a setter reached from
 // inside menu_tick's frame on the same thread does not lock itself out
 std::recursive_mutex menu_mu;
+int menu_item_count(int i) { return i >= 0 && i < kItems ? item_counts[i].load(std::memory_order_relaxed) : -1; }
+int menu_link_age() { return link_age.load(std::memory_order_relaxed); }
 void menu_option_set(int id, int value) {
     if (id == OOT_CHEAT_AGE_ID) {   // (Link's age: the Switch age row shows it)
-        if (link_age.exchange(value, std::memory_order_relaxed) != value && page == 0 && cur_tab == TAB_DEBUG) menu_refresh = true;
+        if (link_age.exchange(value, std::memory_order_relaxed) != value && ((page == 0 && cur_tab == TAB_DEBUG) || page == 6))
+            menu_refresh = true;   // (and the Travel page's list, of Link's age)
         return;
     }
     if (id == OOT_CHEAT_RUPEES_ID) {   // (Link's rupees: the Rupees row shows them)
         if (link_rupees.exchange(value, std::memory_order_relaxed) != value && page == 0 && cur_tab == TAB_DEBUG) menu_refresh = true;
+        return;
+    }
+    if (id == OOT_TP_MAP_ID) return teleport_map_now.store(value, std::memory_order_relaxed);   // (hookshot: the place nearest Link)
+    if (id == OOT_TP_CAPTURE_ID) {   // (hookshot: Link stayed near a place: its picture wanted when it has none)
+        if (value >= 0 && value < OOT_TP_PLACES) {
+            PictureJob j;
+            j.kind = PictureJob::Arrived, j.place = value;
+            picture_job(std::move(j));
+        }
         return;
     }
     if (id >= OOT_CHEAT_ITEM_BASE && id < OOT_CHEAT_ITEM_BASE + kItems) {   // (the game side's inventory counts)
@@ -5866,6 +6461,14 @@ void teleport_mouse(const MkwVkPointer& ptr, int mx, int my, bool* press, bool& 
     if (ptr.pressed & HOS_MOUSE_RIGHT) press[5] = true;
     if (ptr.wheel) teleport_wheel += ptr.wheel, teleport_follow = false, changed = true;
 }
+void travel_open() {   // (the Debug tab's Travel row: the page, Link's own age first; pictures are taken from now on)
+    page = 6, travel_pick = -1, travel.adult = -1, travel_list(), travel_follow = true;
+    if (!travel_pictures_on.exchange(true, std::memory_order_relaxed)) {
+        PictureJob j;
+        j.kind = PictureJob::Begin;
+        picture_job(std::move(j));
+    }
+}
 /// A debug tool's row on the Debug tab (Row::cheat i): Left and Right, and confirm (press[7]: A, Enter, a click). Teleport and
 /// Inventory open their pages; back from them comes to the Debug tab, the row still selected
 void cheat_press(int i, const bool* press, bool& changed) {
@@ -5910,6 +6513,7 @@ void cheat_press(int i, const bool* press, bool& changed) {
         changed = true;
     }
     if (press[7] && i == 8) page = 3, teleport_follow = true, changed = true;
+    if (press[7] && i == 13) travel_open(), changed = true;
     if (press[7] && i == 10) page = 4, choose_inventory_filter(0), changed = true;
     if (i == 9 && (press[3] || press[4])) {   // (Kid | Adult: Left Kid, Right Adult, a switch when Link is the other age)
         const int age = link_age.load(std::memory_order_relaxed);
@@ -5992,6 +6596,13 @@ void outputs_follow_screen() {
          dm::ratio_name({sw, sh}).c_str(), added);
 }
 
+/* Called at tick exit, after every navigation/close path. Only an explicit button enables capture. */
+void mic_test_tick(bool focused) {
+    if (!focused || !open_now.load() || cur_tab != TAB_AUDIO || page != 0 || opts.mic == 0) mic_testing = false;
+    mic_levels[0] = mic_levels[1] = 0;
+    mic_test_state = host && host->mic_test ? host->mic_test(mic_testing, opts.microphone_gain, mic_levels) : 0;
+    if (!(mic_test_state & 1)) mic_testing = false;
+}
 void menu_tick() {
     std::lock_guard lk(menu_mu);   // (the control bridge's settings: menu_setting_set)
     share_finish();   // (Save my pipeline list's worker, done)
@@ -6008,6 +6619,7 @@ void menu_tick() {
     DWORD pid = 0;
     if (fg) GetWindowThreadProcessId(fg, &pid);
     const bool mine = pid == GetCurrentProcessId();
+    struct MicTick { bool focused; ~MicTick() { mic_test_tick(focused); } } mic_tick{mine};
     bool press[K_N] = {};
     for (int i = 0; i < K_N; i++) {
         const bool down = mine && (GetAsyncKeyState(keys[i]) & 0x8000) != 0;
@@ -6198,7 +6810,8 @@ void menu_tick() {
         // (the layout row shows the controls as they are: host/nn_hid.c keeps them, the ini's pad_ lines, and a saved
         // layout is not applied over them at start)
         if (open_now.load()) opts.pad_layout = detect_pad_layout();
-        if (open_now.load()) dlss_probe(), fsr4_probe(), xess_probe();   // (whether the Upscaler row can offer DLSS, FSR and XeSS: asked once)
+        // (whether the Upscaler row can offer DLSS, FSR and XeSS here, and Frame generation by DLSS FG: asked once)
+        if (open_now.load()) dlss_probe(), dlss_fg_probe(), fsr4_probe(), xess_probe();
         if (open_now.load()) refresh_mics();   // (the microphones as they are now)
         if (open_now.load()) refresh_outputs();
     }
@@ -6390,6 +7003,52 @@ void menu_tick() {
             }
             if (item_choice != chosen) inventory_reveal();   // (a click on a card: its page)
         }
+    } else if (open_now.load() && page == 6) {   // (hookshot) the Travel page
+        travel_list();
+        const int n = (int)travel.place.size(), areas = (int)travel.areas.size();
+        press[9] |= pad(HOS_PAD_WEST);   // (Y on a pad, as Backspace: the picture taken again)
+        bool switch_age = press[12] || pad(HOS_PAD_NORTH);   // (Tab, or X on a pad: the other age's places)
+        if (press[12]) tab_left = tab_right = false;   // (Tab is the tabs' key elsewhere: here the age's alone)
+        if (mouse) {
+            const menu_hit::Hit hit = hits.at((float)mx, (float)my);
+            if (ptr.pressed & HOS_MOUSE_LEFT) {
+                if (hit.part == menu_hit::kListLine && hit.index >= 0 && hit.index < n)
+                    travel_choice = hit.index, travel_follow = true, changed = true;
+                else if (hit.part == menu_hit::kButton && hit.index == 0) press[7] = true;
+                else if (hit.part == menu_hit::kButton && hit.index >= 10 && hit.index - 10 != travel.adult) switch_age = true;
+            }
+            if (ptr.pressed & HOS_MOUSE_RIGHT) press[5] = true;
+            if (ptr.wheel) travel_wheel += ptr.wheel, travel_follow = false, changed = true;
+        }
+        if (switch_age) {
+            travel_pick = !travel.adult, travel_choice = 0;
+            travel_list();
+            changed = true;
+        } else if (press[5]) page = 0, changed = true;   // (to the Debug tab, Travel still selected)
+        else if (press[7] && n) {
+            cheat_action.store(OOT_PLACE_ACTION + travel.place[travel_choice] * 2 + travel.adult);
+            open_now = false, page = 0;   // (back to the game: the map change starts with an event)
+            changed = true;
+        } else if (press[9] && n) {
+            PictureJob j;
+            j.kind = PictureJob::Forget, j.place = travel.place[travel_choice];
+            picture_job(std::move(j));
+            travel_tex_key.clear();
+            changed = true;
+        } else if (n) {
+            const int was = travel_choice;
+            if (press[15]) travel_choice = 0;
+            else if (press[16]) travel_choice = n - 1;
+            else if (press[13] || press[14]) travel_choice = std::clamp(travel_choice + (press[14] ? 1 : -1) * travel_page_rows, 0, n - 1);
+            else if (press[1] || press[2]) travel_choice = (travel_choice + n + (press[2] ? 1 : -1)) % n;
+            if (press[3] || press[4] || tab_left || tab_right) {   // (to the first place of the previous or next area)
+                int area = travel_area_of(travel_choice);
+                const bool back = press[3] || tab_left;
+                if (!back || travel_choice == travel.areas[area].first) area = (area + areas + (back ? -1 : 1)) % areas;
+                travel_choice = travel.areas[area].first;
+            }
+            if (travel_choice != was) travel_follow = true, changed = true;
+        }
     } else if (open_now.load() && page == 3) {   // the teleport list
         if (mouse) teleport_mouse(ptr, mx, my, press, changed);
         if (press[5]) page = 0, changed = true;   // (to the Debug tab, Teleport still selected)
@@ -6533,6 +7192,10 @@ void menu_tick() {
                     }
                 }
             } else if (r.cheat >= 0) cheat_press(r.cheat, press, changed);   // (a debug tool: on the Debug tab itself)
+            else if (press[7] && !strcmp(r.name, "Test microphone")) {   // (the microphone's test: started and stopped here)
+                if (opts.mic != 0 && host && host->mic_test) mic_testing = !mic_testing;
+                press[7] = false, changed = true;
+            }
             else if (press[7] && is_motion_row(r)) cur_tab = TAB_MOTION, tab_selected[TAB_MOTION] = 0, press[7] = false, changed = true;
             else if (press[7] && is_fps_dev_row(r)) cur_tab = TAB_FPS_DEV, tab_selected[TAB_FPS_DEV] = 0, press[7] = false, changed = true;
             else if (press[7] && is_share_row(r)) share_pipeline_list(), press[7] = false, changed = true;
@@ -6579,7 +7242,7 @@ void menu_tick() {
         if (fps_take(now, shown_frames.load(), game_frames.load(), &next, &last_shown, &last_game, &shown, &game)) {
             snprintf(fps_text, sizeof fps_text, "%.0f", shown);
             fps_rate_now = opts.framegen >= 1 ? game : shown;   // (the game's own against its cap, with frame generation too)
-            // (the game's own rate, "Base", and who makes the frames: DLSS FG, FSR 3.1 FG or Built-in FG)
+            // (the game's own rate, "Base", and who makes the frames: DLSS FG, FSR 3.1 FG or Built-in FG, or DLSS FG paused)
             const char* who = framegen_maker_name();
             if (opts.framegen >= 1 && who) snprintf(fps_sub, sizeof fps_sub, "Base %.0f, %s", game, who);
             else if (opts.framegen >= 1) snprintf(fps_sub, sizeof fps_sub, "Base %.0f", game);
@@ -6596,7 +7259,8 @@ void menu_record(VkCommandBuffer cmd, uint32_t index, uint32_t w, uint32_t h) {
     const bool start = startup_on.load(std::memory_order_acquire);
     const bool fps = opts.show_fps && !start;   // (no game frames yet: not "0 FPS" over the start-up screen)
     const bool open = open_now.load(std::memory_order_relaxed);
-    if (!start && !fps && !open) {   // (nothing shows: no ImGui frame, no render pass)
+    const bool notice = !open && !start && prof_now() < notice_until.load(std::memory_order_relaxed);   // (hookshot: a Travel picture)
+    if (!start && !fps && !open && !notice) {   // (nothing shows: no ImGui frame, no render pass)
         // (but a new window size or Menu size since the last bake: one frame with nothing drawn that bakes the menu's glyphs
         // and measures its page for the new size, so the next open has no hitch whatever was resized while nothing showed)
         if (prebake_needed(w, h) && ui::begin(w, h)) {
@@ -6621,6 +7285,7 @@ void menu_record(VkCommandBuffer cmd, uint32_t index, uint32_t w, uint32_t h) {
     if (start) draw_startup(c);   // (under the menu)
     if (open) draw_menu(c);
     if (fps) draw_fps(c, open);
+    if (notice) draw_travel_notice(c);
     ::mkwvk::rec::boundary(::mkwvk::rec::B_DIRECT);   // (Dear ImGui records into cmd directly, its backend through its own pointers: what this thread recorded through vk_work.h reaches cmd first)
     ui::record(cmd, index, w, h);
 }

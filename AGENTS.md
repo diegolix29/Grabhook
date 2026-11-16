@@ -23,6 +23,9 @@ What CONTRIBUTING.md does not spell out, and agents trip on:
 - **Two platforms.** Windows builds with llvm-mingw, Linux with clang/gcc. Keep host code portable, and paths UTF-8
   (no `CP_ACP`; `tests/test_utf8_paths.py`).
 - **No game in CI.** Checks must run without a dump. A run in the game is for you to do locally and report.
+- **Builds and game runs go through the PC's job queue** (`scripts/job_queue.py`): `--mode timing` for numbers,
+  `--mode shared` for every other game run. Never on a RAM file system
+  (`/tmp` is often one): [Sharing a PC](docs/development.md#sharing-a-pc-the-job-queue).
 - **Test a change against a base, not in a new full build**: `scripts/dev_packs.py`, [Testing a change against a
   base](docs/development.md#testing-a-change-against-a-base). Agents sharing a PC share one base and agree before
   moving it; it is for development and A/B runs only. Bases, packs and runtimes are built from the game: never send them.

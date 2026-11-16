@@ -314,6 +314,66 @@ static void game_menu_press(LPARAM lp, LONG bit) {
     gm_mouse_used();
     pointer_publish_at(hwnd, at, (uint32_t)bit, 0);
 }
+/* (hookshot) The item wheel (host/oot_wheel.c) for the mouse: while it is open the mouse is let go and the
+   pointer put in the wheel's middle, hidden until the mouse moves 5 pixels (R or L is held the whole time: a controller's
+   opening as a rule); the item under it is picked, a left click picks it and closes the wheel, the mouse wheel turns its
+   pages. The capture it had comes back when the wheel closes. The input thread posts WM_APP + 20 (wParam 1 open, 0 closed) */
+static volatile LONG wheel_click, wheel_click_x, wheel_click_y, wheel_notches;
+static int wheel_open_now, captured_before_wheel, wheel_cursor_hidden, wheel_mx, wheel_my;
+
+void hos_wheel_mouse_open(int open) {
+    if (hwnd) PostMessageA(hwnd, WM_APP + 20, (WPARAM)(open != 0), 0);
+}
+/* the free pointer in client pixels and the client's size: 1 when it is over the window, the window in front and the
+   mouse not captured. *clicked: a left click since the last call (its place in *click_x, *click_y) */
+int hos_wheel_pointer(int32_t *x, int32_t *y, int32_t *w, int32_t *h, int *clicked, int32_t *click_x, int32_t *click_y) {
+    *clicked = (int)InterlockedExchange(&wheel_click, 0);
+    *click_x = wheel_click_x, *click_y = wheel_click_y;
+    AcquireSRWLockShared(&pointer.lock);   /* (main's pointer sample, looked at: the menus' clicks stay theirs) */
+    const MkwVkPointer at = pointer.point;
+    const int active = pointer.active;
+    ReleaseSRWLockShared(&pointer.lock);
+    *x = at.x, *y = at.y, *w = at.width, *h = at.height;
+    return hwnd && !mouse_captured && active && at.width > 0 && at.height > 0 && GetForegroundWindow() == hwnd;
+}
+/* the mouse wheel's notches since the last call, while the item wheel is open (away from the player positive) */
+int hos_wheel_notches_take(void) {   /* (the item wheel's own; hos_mouse_wheel_take is the menus') */
+    const LONG v = InterlockedExchange(&wheel_notches, 0);
+    if (v % WHEEL_DELTA) InterlockedExchangeAdd(&wheel_notches, v % WHEEL_DELTA);   /* (a part of a notch: kept) */
+    return (int)(v / WHEEL_DELTA);
+}
+static void wheel_cursor(int hidden) {
+    if (hidden == wheel_cursor_hidden) return;
+    wheel_cursor_hidden = hidden;
+    ShowCursor(hidden ? FALSE : TRUE);
+}
+static void wheel_mouse(HWND w, int open) {
+    if (open == wheel_open_now) return;
+    wheel_open_now = open;
+    InterlockedExchange(&wheel_click, 0), InterlockedExchange(&wheel_notches, 0);
+    if (open) {
+        captured_before_wheel = (int)mouse_captured && !menu_open;
+        if (captured_before_wheel) {
+            mouse_capture(w, 0);
+            RECT rc;
+            GetClientRect(w, &rc);
+            POINT p = {rc.right / 2, rc.bottom / 2};
+            ClientToScreen(w, &p);
+            SetCursorPos(p.x, p.y);
+            pointer_publish_at(w, (POINT){rc.right / 2, rc.bottom / 2}, 0, 0);
+        }
+        POINT at = {0};
+        GetCursorPos(&at);
+        ScreenToClient(w, &at);
+        wheel_mx = at.x, wheel_my = at.y;
+        wheel_cursor(1);
+    } else {
+        wheel_cursor(0);
+        if (captured_before_wheel && !menu_open && GetForegroundWindow() == w) mouse_capture(w, 1);
+        captured_before_wheel = 0;
+    }
+}
+
 static void menu_press(HWND w, LPARAM lp, LONG bit) {   /* (a click while the menu is open: the menu's) */
     const POINT at = {(short)LOWORD(lp), (short)HIWORD(lp)};
     SetCapture(w);   /* a drag past the window edge still reaches it */
@@ -385,8 +445,25 @@ int hos_key_down(int vk) {
     return (only || key_state_deaf()) && key_msg[vk & 255];
 }
 
+/* (hookshot) The item wheel's mouse in the window procedure, before its own cases: 1 when the message was the wheel's.
+   WM_APP + 20 opens or closes it (hos_wheel_mouse_open); while it is open the mouse wheel turns its pages and a left click
+   (not one on the Insert menu or a game menu) picks, and the hidden cursor comes back once the mouse moves */
+static int wheel_msg(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_APP + 20) return wheel_mouse(w, (int)wp), 1;
+    if (!wheel_open_now) return 0;
+    if (msg == WM_MOUSEMOVE && wheel_cursor_hidden && !mouse_captured &&
+        (abs((short)LOWORD(lp) - wheel_mx) > 4 || abs((short)HIWORD(lp) - wheel_my) > 4)) wheel_cursor(0);
+    if (msg == WM_MOUSEWHEEL) return InterlockedExchangeAdd(&wheel_notches, GET_WHEEL_DELTA_WPARAM(wp)), 1;
+    if (msg == WM_LBUTTONDOWN && !menu_open && !game_menu_open) {
+        InterlockedExchange(&wheel_click_x, (short)LOWORD(lp)), InterlockedExchange(&wheel_click_y, (short)HIWORD(lp));
+        return InterlockedExchange(&wheel_click, 1), 1;
+    }
+    return 0;
+}
+
 static LRESULT CALLBACK wndproc(HWND w, UINT msg, WPARAM wp, LPARAM lp) {
     key_messages(msg, wp, lp);
+    if (wheel_msg(w, msg, wp, lp)) return 0;
     switch (msg) {
     case WM_MOUSEMOVE: {
         if (mouse_captured) return 0;

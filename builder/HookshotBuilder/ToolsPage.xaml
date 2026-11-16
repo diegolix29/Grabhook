@@ -143,7 +143,7 @@
 
     <!-- ===== Mods ===== -->
     <Grid x:Name="ModsView" Grid.Row="1" Margin="0,18,0,0">
-      <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="*"/></Grid.RowDefinitions>
+      <Grid.RowDefinitions><RowDefinition Height="Auto"/><RowDefinition Height="Auto"/><RowDefinition Height="*"/><RowDefinition Height="Auto"/></Grid.RowDefinitions>
       <Grid>
         <Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
         <TextBlock x:Name="ModsNote" Style="{StaticResource Note}" VerticalAlignment="Center" Margin="0,0,16,0"
@@ -153,11 +153,25 @@
           <Button Style="{StaticResource Small}" Content="Open mods folder" Margin="8,0,0,0" Click="OpenModsClick"/>
         </StackPanel>
       </Grid>
-      <Border Grid.Row="1" Style="{StaticResource Card}" Margin="0,12,0,0">
+      <!-- (the code patches ticked are not the ones the game was built with: Rebuild, or Apply a mix built before; PatchBuilds.cs) -->
+      <Border x:Name="PatchBar" Grid.Row="1" Margin="0,12,0,0" Padding="14,10" CornerRadius="10" Background="{StaticResource WarnSoft}"
+              BorderBrush="#33E2B86B" BorderThickness="1" Visibility="Collapsed">
+        <Grid>
+          <Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
+          <TextBlock x:Name="PatchText" Style="{StaticResource Note}" Foreground="{StaticResource Ink}" VerticalAlignment="Center" Margin="0,0,14,0"/>
+          <Button x:Name="PatchButton" Grid.Column="1" Style="{StaticResource Primary}" Height="34" FontSize="13" Padding="16,0" Click="PatchClick"/>
+        </Grid>
+      </Border>
+      <Border Grid.Row="2" Style="{StaticResource Card}" Margin="0,12,0,0">
         <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
           <StackPanel x:Name="ModRows" Margin="6"/>
         </ScrollViewer>
       </Border>
+      <!-- (the builds kept for each mix: how much room they take, and letting them go) -->
+      <StackPanel x:Name="KeptRow" Grid.Row="3" Orientation="Horizontal" Margin="2,8,0,0" Visibility="Collapsed">
+        <TextBlock x:Name="KeptText" Style="{StaticResource Faint}" VerticalAlignment="Center"/>
+        <Button Style="{StaticResource LinkButton}" Content="Free this space" FontSize="12" Margin="10,0,0,0" Click="FreeKeptClick"/>
+      </StackPanel>
     </Grid>
 
     <!-- ===== Save editor ===== -->
@@ -255,7 +269,15 @@
       <Grid.ColumnDefinitions><ColumnDefinition/><ColumnDefinition Width="Auto"/></Grid.ColumnDefinitions>
       <TextBlock x:Name="Status" Style="{StaticResource Note}" VerticalAlignment="Center" Margin="0,0,16,0" TextTrimming="CharacterEllipsis"/>
       <StackPanel Grid.Column="1" Orientation="Horizontal">
-        <Button x:Name="RevertButton" Style="{StaticResource Quiet}" Content="Undo changes" Click="RevertClick"/>
+        <Button x:Name="ReloadButton" Style="{StaticResource Quiet}" Click="ReloadClick" AutomationProperties.Name="Reload"
+                ToolTip="Read the mods folder and the saves again (your changes not saved yet stay)">
+          <StackPanel Orientation="Horizontal">
+            <Path Data="M13.5,4 A6,6 0 1 0 14,9.5 M13.5,0.5 L13.5,4 L10,4" Stroke="{StaticResource Ink}" StrokeThickness="1.6"
+                  StrokeStartLineCap="Round" StrokeEndLineCap="Round" StrokeLineJoin="Round" VerticalAlignment="Center" Margin="0,0,8,0"/>
+            <TextBlock Text="Reload" FontSize="14" FontWeight="SemiBold" Foreground="{StaticResource Ink}"/>
+          </StackPanel>
+        </Button>
+        <Button x:Name="RevertButton" Style="{StaticResource Quiet}" Content="Undo changes" Margin="10,0,0,0" Click="RevertClick"/>
         <Button x:Name="SaveButton" Style="{StaticResource Primary}" Height="40" Content="Save" Margin="10,0,0,0" Click="SaveClick"/>
         <Button Style="{StaticResource GoButton}" Height="40" Padding="22,0" Margin="10,0,0,0" Click="SavePlayClick">
           <StackPanel Orientation="Horizontal">

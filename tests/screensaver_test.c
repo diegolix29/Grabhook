@@ -87,6 +87,7 @@ static LONG InterlockedExchangeAdd(volatile LONG *target, LONG value) {
 static void mouse_capture(HWND w, int on) { (void)w; (void)on; unexpected(); }
 /* (display.c: the keys the window's own messages say are down, for hos_key_down; nothing to note here) */
 static void key_messages(UINT msg, WPARAM wp, LPARAM lp) { (void)msg; (void)wp; (void)lp; }
+static int wheel_msg(HWND w, UINT msg, WPARAM wp, LPARAM lp) { (void)w; (void)msg; (void)wp; (void)lp; return 0; }   /* (the item wheel's mouse: closed here) */
 static void set_fullscreen(HWND w, int on) { (void)w; (void)on; unexpected(); }
 static BOOL SetWindowPos(HWND w, HWND after, int x, int y, int width, int height, UINT flags) {
     (void)w; (void)after; (void)x; (void)y; (void)width; (void)height; (void)flags; unexpected(); return FALSE;

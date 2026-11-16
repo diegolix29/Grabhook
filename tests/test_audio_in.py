@@ -444,7 +444,7 @@ def main():
     # (the menu's row reaches the host: hos_mic_select, in the table it is given)
     check('"Microphone", &opts.mic, 0,' in (ROOT / 'gpu' / 'vk' / 'vk_menu.cpp').read_text(encoding='utf-8'),
           'the Insert menu has no Microphone row')
-    check(re.search(r'hos_mic_count,\s*hos_mic_name,\s*hos_mic_select', (ROOT / 'host' / 'rx_backend.c').read_text(encoding='utf-8')),
+    check(re.search(r'hos_mic_count,\s*hos(?:t)?_mic_name,\s*hos_mic_select', (ROOT / 'host' / 'rx_backend.c').read_text(encoding='utf-8')),
           'the menu is not given the microphones')
     check('mic_want = mic_key(eq + 1);' in (ROOT / 'gpu' / 'vk' / 'vk_menu.cpp').read_text(encoding='utf-8'),
           'the saved microphone is not read through mic_key')

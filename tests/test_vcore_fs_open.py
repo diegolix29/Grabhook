@@ -58,6 +58,8 @@ typedef struct { uint64_t x[32]; } Ctx;
 #define HOS_FS_PATH 1024
 #define R_PATH_NOT_FOUND 0x202
 static int hos_trace;
+static volatile long writes_open;   /* (files open for writing: host/nn_fs.c, hos_fs_writing) */
+static long InterlockedIncrement(volatile long *p) { return ++*p; }
 static int fs_trace(void) { return 0; }
 static void hos_log(const char *f, ...) { (void)f; }
 static const char *gstr(uint64_t a) { return (const char *)(uintptr_t)a; }

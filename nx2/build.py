@@ -57,7 +57,7 @@ NX2_RT = os.path.join(kit.HERE, "rt")
 HOST = os.path.join(kit.HERE, "..", "host")
 OPUS = os.path.join(kit.HERE, "..", "third_party", "opus")
 ZSTD = os.path.normpath(os.path.join(kit.HERE, "..", "third_party", "zstd", "lib"))
-ZSTD_HOST = ("prompts.c", "hos_zstd.c", "zs.c")   # (the host files that use it: a mod's size table; the game's stream decode)
+ZSTD_HOST = ("prompts.c", "hos_zstd.c", "zs.c", "hl_stream.c")   # (the host files that use it: a mod's size table; the game's stream decode)
 OBJ_CACHE = os.path.join(kit.WORK, "objcache")
 # (HOOKSHOT_OBJ_STORE: one store of objects for every work folder, nx2/object_store.py. Its folder for this work folder's compiler
 # and headers, or None)
@@ -429,6 +429,13 @@ def HOT_ORDER():
 HOST_LIBS = ["-lpthread", "-ldl", "-lm"] if LINUX else \
     ["-luser32", "-lwinmm", "-ladvapi32", "-lole32", "-lshell32", "-lgdi32", "-ldbghelp"]
 GPU = os.path.join(kit.HERE, "..", "gpu")
+# (Hookshot) the native engine (engine/native, C++20: docs/native-engine): its own headers and the standard library only;
+# host/hl_host.c and one host/hl_<module>.c a module are the OS layer's side of it
+NATIVE = os.path.normpath(os.path.join(kit.HERE, "..", "native"))
+
+
+def native_sources():
+    return sorted(os.path.join(d, f) for d, _, fs in os.walk(os.path.join(NATIVE, "src")) for f in fs if f.endswith(".cpp"))
 # FFmpeg (libavcodec's VP8/VP9 decoders, swscale) for nn::codec's video decoders (host/nn_video.c): the static build
 # in the Eglantine clone's package cache
 FFMPEG = None   # (found in the CPM caches below, once cpm_dirs is defined)
@@ -508,7 +515,7 @@ def depfile_of(obj):
 
 def renderer_deps(blob, roots, obj):
     """The headers under roots that obj's last compile read (its depfile), by name and content; blob, the whole folders', when
-    there is no depfile or it names nothing under them"""
+    there is no depfile or it names nothing under them. The back end's own objects and the host's"""
     try:
         with open(depfile_of(obj), encoding="utf-8", errors="replace") as f:
             paths = depfile_paths(f.read())
@@ -682,8 +689,8 @@ COMPILER_MB = 1500
 # lift wrote them, so its patches, cuts and lists never see the pieces). On by default at split_giants.PIECE_KB (8): a whole
 # first build's compile 1,347 -> 1,057 s on a Ryzen 5 5600. "0": off; a number: the pieces' size in KB
 def split_giants_flags():
-    """The flag the lifted chunks carry when their giants are split (split_giants.FLAG: the piece size and the splitter's own
-    hash, so a change of either builds them again); [] when off"""
+    """The flag the lifted chunks and the hot pieces carry when their giants are split (split_giants.FLAG: the piece size and
+    the splitter's own hash, so a change of either builds them again); [] when off"""
     raw = os.environ.get("HOOKSHOT_SPLIT_GIANTS", "").strip()
     if raw == "0":
         return []
@@ -788,6 +795,18 @@ def rss_mb(proc):
         return 0
 
 
+def largest_function(text):
+    """The largest function of a lifted file's text, in bytes: each function from the newline before its definition, as mem_need
+    was first measured; a giant's pieces are functions of their own (split_giants.py, the copy compile_one compiles)"""
+    starts = [m.start() - 1 for m in lifted_c.HEAD_BYTES.finditer(text)]
+    i = text.find(b"\nstatic __attribute__((noinline)) uintptr_t s_")
+    while i >= 0:
+        starts.append(i)
+        i = text.find(b"\nstatic __attribute__((noinline)) uintptr_t s_", i + 1)
+    starts = sorted(starts) + [len(text)]
+    return max([b - a for a, b in zip(starts, starts[1:])] or [0])
+
+
 def mem_need(src):
     """What compiling a file takes at its peak, in MB, a little over. Measured on a cold build (clang 23, x86-64): a chunk of lifted
     code 0.4 GB + 50 MB per MB of C + 250 MB per MB of its largest function (1.5 GB for 24 MB of small functions, 2.2 GB for a 6 MB
@@ -799,16 +818,7 @@ def mem_need(src):
     if name.startswith("code_"):
         with open(src, "rb") as f:
             text = f.read()
-        # (each function from the newline before its definition, as this was first measured; a giant's pieces are functions
-        # of their own: split_giants.py, the copy compile_one compiles)
-        starts = [m.start() - 1 for m in lifted_c.HEAD_BYTES.finditer(text)]
-        i = text.find(b"\nstatic __attribute__((noinline)) uintptr_t s_")
-        while i >= 0:
-            starts.append(i)
-            i = text.find(b"\nstatic __attribute__((noinline)) uintptr_t s_", i + 1)
-        starts = sorted(starts) + [len(text)]
-        largest = max([b - a for a, b in zip(starts, starts[1:])] or [0])
-        return int(400 + 50 * len(text) / (1 << 20) + 250 * largest / (1 << 20))
+        return int(400 + 50 * len(text) / (1 << 20) + 250 * largest_function(text) / (1 << 20))
     return 1000 if src.endswith(".cpp") else 400
 
 
@@ -1022,6 +1032,89 @@ def flags(gen, rt64, opt, polls):
         (["-DA64_POLLING"] if polls else []) + WRITE_TRACK
 
 
+# HOOKSHOT_LIGHT_PASSES (on by default; 0 turns it off): ordinary lifted chunks compile at -O1 without its module passes (the
+# inliner, ipsccp, globalopt, function-attrs ...: -mllvm -opt-disable; LLVM skips only passes it marks optional, so the code
+# stays correct). Measured on single chunks (bold/clanglab): -21..-34% compile time, +3..5% code, the same peak memory, and
+# -O1's inliner barely inlines lifted code (the same call counts); the few helpers it did inline are always_inline in the
+# lifter's headers (a64_lift.py VFPX_HEADER). A chunk with a function of HOOKSHOT_LIGHT_PASSES_KB (1024) KB of C or more keeps
+# every pass: without the module passes a giant function's later passes blow up (3.25-4.7 GB, 8x the time). The size is
+# the lifted function's: a chunk whose functions HOOKSHOT_SPLIT_GIANTS cuts (256 KB or more) compiles its pieces light too
+# (measured on the game's 50 such chunks: -22% compile, the same symbols, +3.2% code). The hot pieces (code_hot*) keep
+# theirs (-O2 and the profile). The flags are part of each object's key (object_key), so a light object and a full one are never taken for each other.
+# opt-bisect-verbose=false: without it the option prints a line for every pass on every function
+LIGHT_PASSES = ["ipsccp", "called-value-propagation", "globalopt", "openmp-opt", "deadargelim", "globaldce", "elim-avail-extern",
+                "rpo-function-attrs", "function-attrs", "constmerge", "cg-profile", "rel-lookup-table-converter", "inline",
+                "inliner-ml-advisor-release"]
+LIGHT_FLAGS = ["-mllvm", "-opt-disable=" + ",".join(LIGHT_PASSES), "-mllvm", "-opt-bisect-verbose=false"]
+
+
+def light_passes_kb():
+    """The largest function (KB of C) a lifted chunk may hold and still compile without the module passes; None: off"""
+    if os.environ.get("HOOKSHOT_LIGHT_PASSES", "").strip().lower() in ("0", "false", "off", "no"):
+        return None
+    try:
+        kb = max(1, int(os.environ.get("HOOKSHOT_LIGHT_PASSES_KB") or 1024))
+    except ValueError:
+        kb = 1024
+    return kb
+
+
+def light_flags_work(cc):
+    """Whether cc takes LIGHT_FLAGS: one tiny compile. -opt-disable is LLVM 22's, and a Linux system's older clang (README: it
+    builds, without the play profile) stops at it, so every light chunk would fail: with such a compiler they keep every pass"""
+    try:
+        r = subprocess.run([cc, "-x", "c", "-O1", "-Wno-everything", "-S", "-o", "-", "-"] + LIGHT_FLAGS,
+                           input="int f(int x) { return x + 1; }\n", capture_output=True, text=True, encoding="utf-8",
+                           errors="replace")
+    except OSError as e:
+        r = subprocess.CompletedProcess([cc], 1, "", str(e))
+    if r.returncode:
+        print("build: this compiler does not take the light passes' flags (%s): every lifted chunk keeps -O1's module passes"
+              % (r.stderr.strip().splitlines() or ["?"])[0], flush=True)
+    return r.returncode == 0
+
+
+def lifted_largest(src):
+    """A lifted file's largest function in bytes (largest_function), from the record (HASHES) while it still describes the file,
+    so a build reads no lifted file it already knows"""
+    entry, st = known(src)
+    if entry is not None and isinstance(entry.get("largest"), int):
+        return entry["largest"]
+    with open(src, "rb") as f:
+        content = f.read()
+    largest = largest_function(content)
+    remember(src, st, content)["largest"] = largest
+    return largest
+
+
+def lifted_flags(src, fl, deps, bar_kb):
+    """A lifted chunk's flags: fl, or fl + LIGHT_FLAGS (light_passes_kb). A kept file that is not on disk gets the flags whose
+    part its list recorded (so the kept objects still fit)"""
+    if bar_kb is None:
+        return fl
+    light = fl + LIGHT_FLAGS
+    if src in KEPT and not os.path.exists(src):
+        return light if KEPT[src][2] == kept_part(light, deps) else fl
+    return light if lifted_largest(src) < bar_kb * 1024 else fl
+
+
+def hot_flags(fl):
+    """The hot pieces' flags (code_hot*.c): fl at RX_HOT_OPT (default O2), so the hot callees inline into their hot callers, and
+    the split (split_giants_flags) the lifted chunks carry: a hot function of split_giants.MIN_KB or more compiles as pieces too
+    (f_81b8c000, 4.79 MB of C, was one -O2 translation unit: 346 s of a from-scratch build's 369 s compile)"""
+    return [("-" + os.environ.get("RX_HOT_OPT", "O2")) if f == "-" + OPT else f for f in fl] + split_giants_flags()
+
+
+def source_flags(src, gen, fl, split_fl, hot_fl, deps, bar_kb):
+    """A source's flags: the hot pieces' hot_fl; a lifted chunk's split_fl, light or not (lifted_flags); fl for the rest"""
+    name = os.path.basename(src)
+    if name.startswith("code_hot"):
+        return hot_fl
+    if name.startswith("code_") and os.path.dirname(src) == gen:
+        return lifted_flags(src, split_fl, deps, bar_kb)
+    return fl
+
+
 def write_info(out):
     meta = json.load(open(os.path.join(kit.WORK, "image", "image.json")))
     mods = {m["name"]: m for m in meta["modules"]}
@@ -1147,6 +1240,8 @@ def load_hashes(out):
             if (isinstance(entry.get("stat"), list) and len(entry["stat"]) == 3 and isinstance(entry.get("sha1"), str)
                     and isinstance(entry.get("keys"), dict)):
                 HASHES[src] = {"stat": [int(x) for x in entry["stat"]], "sha1": entry["sha1"], "keys": dict(entry["keys"])}
+                if isinstance(entry.get("largest"), int):   # (a lifted file's largest function: lifted_largest)
+                    HASHES[src]["largest"] = entry["largest"]
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         HASHES.clear()
         HASHES_AT[0] = 0
@@ -1321,7 +1416,7 @@ def migrate_stamps(gen, obj_dir, fl, deps):
 
 
 PLANNED = {}   # (src, obj) -> the object key plan_jobs worked out, so compile_one does not hash every source again
-DEPFILE_JOBS = {}   # (a back-end object -> the folders' blob, the folders, its other deps: renderer_deps, rekey_depfiles)
+DEPFILE_JOBS = {}   # (a back-end or host object -> the folders' blob, the folders, its other deps: renderer_deps, rekey_depfiles)
 
 
 def rekey_depfiles(jobs):
@@ -1509,8 +1604,8 @@ def main():
     costs = chunk_costs(gen)
     srcs.sort(key=lambda s: -compile_cost(s, costs))
     # (hookshot) code_hot.c, the lift's hot functions together (A64_HOT_FUNCS + A64_HOT_CHUNK=1): at RX_HOT_OPT
-    # (default O2), so the hot callees inline into their hot callers
-    hot_fl = [("-" + os.environ.get("RX_HOT_OPT", "O2")) if f == "-" + OPT else f for f in fl]
+    # (default O2, so the hot callees inline into their hot callers) and with the giants split, as the lifted chunks are
+    hot_fl = hot_flags(fl)
     # (hookshot) the hot code has three functions of about 2 MB of C each (vector float code; 1.4 to 2.7 million instructions once
     # the guest model's helpers are inlined). For a function with no profile, the machine code's loop-invariant motion hoisted
     # every invariant instruction out of their function-wide loop; each one was then live through the whole function, and the
@@ -1528,11 +1623,16 @@ def main():
         # new profile kept the hot code built from the old one)
         with open(PGO, "rb") as f:
             hot_fl = hot_fl + ["-fprofile-instr-use=" + PGO, "-DHOOKSHOT_PROFILE_SHA1=" + hashlib.sha1(f.read(), usedforsecurity=False).hexdigest()[:16]]
-    split_fl = fl + split_giants_flags()   # (the lifted chunks; not the hot pieces, whose profile was counted on the whole functions)
-    jobs = [(cc, s, os.path.join(obj_dir, os.path.basename(s)[:-2] + ".o"),
-             hot_fl if os.path.basename(s).startswith("code_hot") else
-             split_fl if os.path.basename(s).startswith("code_") and os.path.dirname(s) == gen else fl,
+    split_fl = fl + split_giants_flags()   # (the lifted chunks; the hot pieces carry their own split in hot_fl)
+    bar_kb = light_passes_kb()
+    if bar_kb is not None and not light_flags_work(cc):
+        bar_kb = None
+    jobs =[(cc, s, os.path.join(obj_dir, os.path.basename(s)[:-2] + ".o"), source_flags(s, gen, fl, split_fl, hot_fl, deps, bar_kb),
              shim_deps if os.path.dirname(s) == NX2_RT else deps) for s in srcs]
+    if bar_kb is not None:
+        light = sorted(os.path.basename(j[1]) for j in jobs if j[3][-len(LIGHT_FLAGS):] == LIGHT_FLAGS)
+        print("build: %d lifted chunks without -O1's module passes (HOOKSHOT_LIGHT_PASSES, functions under %d KB): %s"
+              % (len(light), bar_kb, " ".join(light)), flush=True)
     if KEPT and OBJ_STORE:   # (a kept object the folder let go that another work folder gave the store)
         object_store.fetch(OBJ_STORE, OBJ_CACHE, [k[0] for k in KEPT.values()])
     if KEPT:   # (the kept translation is used only as it was: the same flags and headers, and every object still cached)
@@ -1554,31 +1654,48 @@ def main():
     print("object keys: game-code headers %s, flags %s, hot flags %s, lifted code %s (%d files)" % (
         fp(deps), fp(norm(fl)), fp(norm(hot_fl)), code.hexdigest()[:10],
         sum(1 for x in srcs if os.path.basename(x).startswith("code_"))), flush=True)
-    # the runtime: ordinary C at -O2, with its own headers (any host/*.h change rebuilds all of it)
+    # the runtime: ordinary C at -O2. (the dev-loop proposal's A6, the host's half) Each file is compiled with -MD and named by
+    # the headers its depfile says it read under host_roots (renderer_deps, as the back end's own files are), so a host/*.h
+    # edit compiles the files that include it. A file with no depfile yet is named by host_blob: every header under host/, the
+    # lifted headers, and gpu/'s own. (host files include gpu/render/rx.h, rx_nvn.h and gpu/vk/oot_cheat_items.h as well
+    # as the three gpu headers the blob named before, so an edit to one of those kept their old objects.) What a file reads
+    # from elsewhere (FFmpeg, dav1d, the system's) is in extras, as before
     host_fl = target() + CPU + (["-I" + POSIX, "-D_GNU_SOURCE"] if LINUX else []) + \
-        ["-I" + HOST, "-I" + rt64, "-I" + gen, "-Wno-everything", "-O2", "-g0", "-mcx16", "-DA64_POLLING"] + WRITE_TRACK
-    host_deps = deps + b"".join(open(os.path.join(HOST, f), "rb").read() for f in sorted(os.listdir(HOST))
-                                if f.endswith(".h"))
-    if LINUX:
-        host_deps += b"".join(open(os.path.join(POSIX, f), "rb").read() for f in sorted(os.listdir(POSIX)) if f.endswith(".h"))
-    host_deps += open(os.path.join(GPU, "vk", "vk_api.h"), "rb").read()   # (the renderer ABI used by host/rx_backend.c)
-    host_deps += open(os.path.join(GPU, "vk", "dlss_math.h"), "rb").read()   # (host/rx_backend.c's DLSS jitter)
-    host_deps += open(os.path.join(GPU, "vk", "compat", "hookshot_env.h"), "rb").read()   # (env_on: the switches' one rule)
-    host_deps += ffmpeg_version_key()
+        ["-I" + HOST, "-I" + rt64, "-I" + gen, "-I" + os.path.join(NATIVE, "include"), "-Wno-everything", "-O2", "-g0", "-mcx16",
+         "-DA64_POLLING"] + WRITE_TRACK
+    # (each host file's key: the headers its last compile read (its depfile, renderer_deps) under these folders, the native
+    # engine's C surface (hl/c, what host/hl_*.c include) among them; every header there when it has none yet)
+    host_roots = (HOST, gen, rt64, GPU, os.path.join(OPUS, "include"), ZSTD, os.path.join(NATIVE, "include"))
+    host_blob = deps + tree_headers(HOST) + tree_headers(GPU, skip=("eden", "sirit", "third_party")) + \
+        tree_headers(os.path.join(NATIVE, "include", "hl", "c"))
+    host_extras = ffmpeg_version_key()
     dav1d = dav1d_windows() if host_srcs else None
     dav1d_fl = ["-DHOOKSHOT_DAV1D", "-I" + os.path.join(dav1d, "include")] if dav1d else []
     if dav1d:
-        host_deps += open(os.path.join(dav1d, "include", "dav1d", "version.h"), "rb").read()
+        host_extras += open(os.path.join(dav1d, "include", "dav1d", "version.h"), "rb").read()
         print("AV1 movies: dav1d (%s)" % dav1d, flush=True)
     zstd_api = b"".join(open(os.path.join(ZSTD, f), "rb").read() for f in sorted(os.listdir(ZSTD)) if f.endswith(".h"))   # (ZSTD_HOST's)
-    jobs += [(cc, s, os.path.join(obj_dir, "host_" + os.path.basename(s)[:-2] + ".o"),
-              host_fl + ["-I" + os.path.join(OPUS, "include")] +
-              (["-I" + os.path.join(FFMPEG, "include")] if FFMPEG else []) +
-              (FFMPEG_LX[0] if LINUX and FFMPEG_LX else []) +
-              ([stamp_def] if os.path.basename(s) == "hos_main.c" else []) +
-              (["-I" + ZSTD] if os.path.basename(s) in ZSTD_HOST else []) +
-              (dav1d_fl if os.path.basename(s) in ("nn_video.c", "dav1d_av1.c") else []),
-              host_deps + (zstd_api if os.path.basename(s) in ZSTD_HOST else b"")) for s in host_srcs]
+    for s in host_srcs:
+        obj = os.path.join(obj_dir, "host_" + os.path.basename(s)[:-2] + ".o")
+        extras = host_extras + (zstd_api if os.path.basename(s) in ZSTD_HOST else b"")
+        DEPFILE_JOBS[obj] = (host_blob, host_roots, extras)
+        jobs.append((cc, s, obj,
+                     host_fl + ["-MD", "-I" + os.path.join(OPUS, "include")] +
+                     (["-I" + os.path.join(FFMPEG, "include")] if FFMPEG else []) +
+                     (FFMPEG_LX[0] if LINUX and FFMPEG_LX else []) +
+                     ([stamp_def] if os.path.basename(s) == "hos_main.c" else []) +
+                     (["-I" + ZSTD] if os.path.basename(s) in ZSTD_HOST else []) +
+                     (dav1d_fl if os.path.basename(s) in ("nn_video.c", "dav1d_av1.c") else []),
+                     renderer_deps(host_blob, host_roots, obj) + extras))
+    # (Hookshot) the native engine (native/, C++20), in the game's executable: each module off unless its switch is set
+    # (host/hl_*.c, docs/native-engine)
+    if host_srcs:
+        ncxx = toolchain.need(toolchain.find("clang++"))
+        nflags = target() + CPU + ["-std=c++20", "-O2", "-g0", "-DNDEBUG", "-Wall", "-Wextra", "-I" + os.path.join(NATIVE, "include")]
+        ndeps = tree_headers(os.path.join(NATIVE, "include"))
+        for src in native_sources():
+            name = os.path.relpath(src, os.path.join(NATIVE, "src")).replace(os.sep, "_")[:-4]
+            jobs.append((ncxx, src, os.path.join(obj_dir, "native_" + name + ".o"), nflags, ndeps))
     # libopus 1.5.2 (third_party/opus, from TOTKPort): nn::codec's hardware Opus decoder (host/nn_codec.c)
     # (hookshot: built for the same CPU target as the rest (CPU), so its float code can be vectorized where the target has
     # AVX2: the vendored copy has no x86 intrinsics files of its own)
@@ -1854,7 +1971,7 @@ def main():
         print("the third-party objects: %d in %s (%d MB), stamp %s" % (
             len(made), a.third_party_objects, sum(e["size"] for e in made.values()) >> 20, tp_stamp[:16]), flush=True)
         return 0
-    rekey_depfiles(vk_jobs)
+    rekey_depfiles(jobs)   # (the back end's own objects and the host's: jobs holds vk_jobs too)
     if OBJ_STORE:   # (after rekey_depfiles: the objects it caches by their depfile's key go to the store too)
         print("object store: %d new objects to it" % object_store.share(OBJ_CACHE, OBJ_STORE), flush=True)
     if a.standalone and not vk_only:
@@ -1867,10 +1984,12 @@ def main():
         exe = os.path.join(out, EXE)   # (+ hookshot.map: crash offsets -> f_<guest address>)
         t = time.time()
         # (--export-dynamic-symbol: the window's state, which the Vulkan back end's own Win32 calls read by name)
+        # (the instrumented objects hold the counters and host/pgo_rt.c writes them: -fprofile-instr-generate at this
+        # final Linux link would make clang look for libclang_rt.profile, which the packaged tools need not have)
         r = run_link([cc] + target() + ["-fuse-ld=lld", "-o", exe] + linker("-Map=" + exe + ".map") +
                      ["-Wl,--gc-sections", "-Wl,--export-dynamic-symbol=hos_posix_*", "@" + rsp] + HOT_ORDER() +
-                     (["-fprofile-instr-generate"] if PGO == "gen" else []) +
-                     (FFMPEG_LX[1] if FFMPEG_LX else []) + HOST_LIBS, exe)
+                     (FFMPEG_LX[1] if FFMPEG_LX else []) + HOST_LIBS +
+                     (["-l:libstdc++.a"] if SYSROOT else ["-lstdc++"]), exe)   # (native/'s C++: static with the AppImage's sysroot)
         undefined = sorted({l.strip() for l in (r.stdout + r.stderr).splitlines() if "undefined symbol" in l})
         if r.returncode:
             print("link FAILED (%.0fs), %d undefined symbols" % (time.time() - t, len(undefined)))
@@ -1938,8 +2057,9 @@ def main():
                 linker("-Map=" + vdll + ".map") + ["-Wl,-Bsymbolic", "-Wl,--gc-sections", "-static-libstdc++", "-static-libgcc", "@" + vrsp] + \
                 ([ngx_library(NGX_SDK, True)] if NGX_SDK else []) + ["-ldl", "-lpthread", "-lm"]
         else:   # (RX_VK_PGO=gen: no profile library, as in the game's link; host/pgo_rt.c writes the counters)
+            # (gdi32: the item wheel's labels, gpu/vk/vk_wheel.cpp)
             link = [cc] + toolchain.native_target() + toolchain.native_link() + \
-                ["-shared", "-o", vdll] + linker("/map:" + vdll[:-4] + ".map") + ["@" + vrsp, "-luser32"] + \
+                ["-shared", "-o", vdll] + linker("/map:" + vdll[:-4] + ".map") + ["@" + vrsp, "-luser32", "-lgdi32"] + \
                 (linker("/nodefaultlib:clang_rt.profile.lib") if os.environ.get("RX_VK_PGO") == "gen" else []) + \
                 (["-lc++", "-lunwind"] if toolchain.mingw() else []) + ngx_link(NGX_SDK, toolchain.mingw())
         r = run_link(link, vdll)

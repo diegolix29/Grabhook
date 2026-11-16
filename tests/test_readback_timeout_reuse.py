@@ -144,6 +144,7 @@ static void destroy_buffer(VkBuffer, VmaAllocation) {}
 static void watch_tex(const Texture*, const char*) {}
 static bool remade_skip_old() { return false; }
 static bool remade_log_on() { return false; }
+static bool park_texture(const Texture&, uint64_t) { return false; }   // (a drawn texture kept in system memory: none here)
 static uint64_t evicted_key(uint64_t gpu, uint32_t, uint32_t, uint32_t) { return gpu; }
 struct Evicted { uint64_t frame; bool rendered; };
 static std::mutex from_memory_mu, evicted_mu;

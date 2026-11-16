@@ -12,6 +12,7 @@
 #define _GNU_SOURCE
 #endif
 #include <errno.h>
+#include <execinfo.h>
 #include <pthread.h>
 #include <sched.h>
 #include <stddef.h>
@@ -236,6 +237,8 @@ static inline DWORD GetCurrentProcessId(void) { return (DWORD)getpid(); }
 DWORD GetCurrentThreadId(void);
 DWORD GetThreadId(HANDLE t);
 DWORD GetProcessId(HANDLE p);
+/* (this process only) a copy that fails on a page that is not mapped or not readable instead of faulting */
+BOOL ReadProcessMemory(HANDLE p, LPCVOID from, void *to, SIZE_T n, SIZE_T *got);
 HANDLE OpenThread(DWORD access, BOOL inherit, DWORD id);
 BOOL DuplicateHandle(HANDLE sp, HANDLE src, HANDLE tp, HANDLE *out, DWORD access, BOOL inherit, DWORD options);
 BOOL CloseHandle(HANDLE h);
@@ -346,6 +349,17 @@ FARPROC GetProcAddress(HMODULE m, LPCSTR name);
 HMODULE GetModuleHandleA(LPCSTR name);
 BOOL GetModuleHandleExA(DWORD flags, LPCSTR name, HMODULE *out);
 DWORD GetModuleFileNameA(HMODULE m, LPSTR out, DWORD cap);
+/* (glibc's backtrace: this thread's return addresses, the first `skip` and this call's own frame left out, as on Windows:
+   not inlined, so that backtrace's first frame is this function's. RX_VK_RB_PROF's call sites; GetModuleHandleA(NULL) is
+   not the exe's base here, so they are offsets from gpu/vk/exe_base.h's) */
+static __attribute__((noinline, unused)) USHORT CaptureStackBackTrace(DWORD skip, DWORD count, void **out, DWORD *hash) {
+    void *bt[64];
+    const int n = backtrace(bt, 64);
+    USHORT k = 0;
+    for (int i = (int)skip + 1; i < n && k < count; i++) out[k++] = bt[i];
+    if (hash) *hash = 0;
+    return k;
+}
 BOOL SetCurrentDirectoryA(LPCSTR dir);
 DWORD GetCurrentDirectoryA(DWORD cap, LPSTR out);
 
@@ -564,6 +578,30 @@ int MessageBoxA(HWND w, LPCSTR text, LPCSTR caption, UINT type);
 #ifndef MB_ICONWARNING
 #define MB_ICONWARNING 0x00000030L
 #endif
+
+/* ---- (Hookshot) calls the performance overlay, the capture pre-copy and the replay workers make: /proc and clock_gettime ---- */
+static inline void GetSystemTimePreciseAsFileTime(FILETIME *ft) { GetSystemTimeAsFileTime(ft); }   /* (already clock_gettime) */
+BOOL SetWaitableTimer(HANDLE t, const LARGE_INTEGER *due, LONG period, void *fn, void *arg, BOOL resume);
+HANDLE CreateEventW(void *attr, BOOL manual, BOOL initial, LPCWSTR name);
+/* (kernel includes idle, as on Windows; from /proc/stat) */
+BOOL GetSystemTimes(FILETIME *idle, FILETIME *kernel, FILETIME *user);
+/* (this process only: getrusage, the start time from /proc/self/stat) */
+BOOL GetProcessTimes(HANDLE p, FILETIME *create, FILETIME *exit, FILETIME *kernel, FILETIME *user);
+/* (a hint on Windows; none here: -1, as when it fails) */
+static inline DWORD SetThreadIdealProcessor(HANDLE t, DWORD cpu) { (void)t, (void)cpu; return (DWORD)-1; }
+/* (no Windows heaps: none listed, nothing summed) */
+static inline DWORD GetProcessHeaps(DWORD n, HANDLE *heaps) { (void)n, (void)heaps; return 0; }
+typedef struct {
+    DWORD dwLength, dwMemoryLoad;
+    DWORDLONG ullTotalPhys, ullAvailPhys, ullTotalPageFile, ullAvailPageFile, ullTotalVirtual, ullAvailVirtual, ullAvailExtendedVirtual;
+} MEMORYSTATUSEX;
+/* (/proc/meminfo: MemTotal, MemAvailable, swap) */
+BOOL GlobalMemoryStatusEx(MEMORYSTATUSEX *ms);
+typedef LONG LSTATUS;
+#define HKEY_LOCAL_MACHINE ((HKEY)(ULONG_PTR)0x80000002)
+#define RRF_RT_REG_SZ 0x00000002
+/* (one value only: the CPU's name, ProcessorNameString, from /proc/cpuinfo's model name; any other is not found) */
+LSTATUS RegGetValueA(HKEY key, LPCSTR sub, LPCSTR value, DWORD flags, DWORD *type, void *data, DWORD *size);
 
 #ifdef __cplusplus
 }

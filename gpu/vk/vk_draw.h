@@ -81,6 +81,8 @@ void dry_marks_begin();   // (at the start of each dry pass: the last targets it
 void draw_stats(int64_t* draws, int64_t* skipped, int64_t* dispatches, int64_t* pipelines);
 void draw_stats2(int64_t* passes, int64_t* mesh, double* pipeline_ms);
 void draw_stats3(int64_t* pending_skips, int64_t* waits, double* wait_ms);
+double draw_shader_wait_ms();   // (the part of draw_stats3's wait_ms spent on programs still being translated, not pipelines)
+int64_t draw_pipe_fresh_skips();   // draws left out for a pipeline in the building, into targets made this frame
 /// (hookshot) pipelines linked from stage libraries in the draw, and the libraries asked of the driver for them: had, and cold;
 /// of the cold, those a worker has built since, and the workers' time in them. False: no stage libraries (RX_VK_GPL)
 bool draw_stats4(int64_t* links, double* link_ms, int64_t* lib_hits, int64_t* lib_cold, int64_t* lib_built, double* lib_build_ms);
@@ -100,6 +102,9 @@ uint64_t ub_generation();
 void ub_thread_off();
 /// The pipeline cache to disk (force: whatever was built since the last save; else only after a few new ones)
 void pipeline_cache_save(bool force);
+void shader_key_commit();   // (RX_VK_SHADER_KEY: what the driver built so far goes to hookshot_compiled.bin)
+/// (hookshot) the serial builds' thread between two builds: a save put off for builds under way, run there (vk_jobs.cpp)
+void pipeline_cache_between_builds();
 /// (hookshot) the serial builds' thread between two builds: a save put off for builds under way, run there (vk_jobs.cpp)
 void pipeline_cache_between_builds();
 /// (hookshot) the Debug tab's Descriptor reuse and Sampler cache rows as the menu has them: they apply in play
@@ -115,8 +120,17 @@ std::string state_list_snapshot(bool* present);
 /// memory yet when the GPU reads it: a copy of the range with them applied, at the offset alloc returns in the
 /// recording's stream (mapped at base), or UINT64_MAX when none overlaps
 uint64_t ub_overlay(uint64_t addr, uint64_t n, uint8_t* base, const std::function<uint64_t(uint64_t)>& alloc);
+/// (HL_UBO_INLINE) those updates copied onto p, the bytes an inline bind carried for [addr, addr + n)
+void ub_overlay_onto(uint64_t addr, uint64_t n, uint8_t* p);
 /// Guest memory as the stream's place sees it: as submitted, the stream's uniform updates before it over it
 bool ub_read(uint64_t addr, void* dst, uint64_t n);
+
+/// (hookshot) vkCreate* that a driver's compiler can fault inside. A fault leaves that one out (result -77) instead of ending
+/// the process. On Windows, Intel's compiler is entered by one thread (IntelDriverGate, vk_internal.h): the caller holds it. The
+/// calls themselves live in vk_draw.cpp's unnamed namespace; these are the ones the other files link to
+VkResult extern_guarded_graphics(VkPipelineCache cache, const VkGraphicsPipelineCreateInfo* ci, VkPipeline* pl);
+VkResult extern_guarded_compute(VkPipelineCache cache, const VkComputePipelineCreateInfo* ci, VkPipeline* pl);
+VkResult extern_guarded_shader_module(const VkShaderModuleCreateInfo* ci, VkShaderModule* m);
 
 /// (hookshot) vkCreate* that a driver's compiler can fault inside. A fault leaves that one out (result -77) instead of
 /// ending the process. On Windows, Intel's compiler is entered by one thread (IntelDriverGate). The calls themselves

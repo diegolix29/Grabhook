@@ -64,6 +64,7 @@ static int CloseHandle(HANDLE handle) {
     handle->closed = 1;
     return 1;
 }
+static void thread_gen_bump(void) {}   /* (HOS_THREAD_OF_CACHE's invalidation: no cache here) */
 static void checked_free(void *memory) {
     CHECK(memory == destroying, "wrong thread freed");
     check_unregistered();

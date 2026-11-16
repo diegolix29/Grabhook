@@ -16,6 +16,9 @@
 #ifndef _WIN32
 #include <unistd.h>   // (sysconf: the RAM, auto_profile)
 #endif
+#ifndef _WIN32
+#include <dlfcn.h>   // (create_device: hos_posix_submit_thread_note, looked up in the exe)
+#endif
 
 #include "vk_api.h"
 #include "vk_draw.h"
@@ -31,7 +34,9 @@ static_assert(mkwvk::kQueueGraphics == VK_QUEUE_GRAPHICS_BIT && mkwvk::kQueueCom
 #include "vk_xess.h"
 #include "vk_reflex.h"
 #include "vk_antilag.h"
+#include "vk_gpu_clock.h"
 #include "vk_progress.h"
+#include "vk_tl_clock.h"   // (RX_VK_TL: the timeline's host time domain)
 #include "vk_programs.h"
 #include "mesh_mode.h"
 #include "crash_markers.h"   // (mkwvk_close_asked: a close is not a crash)
@@ -95,7 +100,7 @@ std::string options_path() {
     }
     return game_folder_path() + "hookshot_options.ini";
 }
-int64_t prof_ns[PROF_COUNT];
+SplitCount prof_ns[PROF_COUNT];
 Device dev;
 PFN_vkGetInstanceProcAddr instance_proc() { return vkx::instance_proc_addr(); }
 /// (hookshot) The driver as it names itself (VkPhysicalDeviceDriverProperties: "NVIDIA 580.95.05", "radv Mesa 25.2.4"), else its
@@ -144,6 +149,73 @@ void logf_at(LogLevel level, const char* fmt, ...) {
 }
 
 namespace {
+
+// (hookshot) A driver that faults in vkCreateShaderModule. On an RX 570 (Polaris, AMD's driver 2.0.220 and 2.0.279) the
+// game closed with no message during its first shader preparation: six "CRASH ... at amdvlk64.dll" lines at once, one per
+// preparation worker, after the step that builds pipelines had been left out ("the last start did not finish the driver's part"),
+// so the only driver call left there is vkCreateShaderModule (vk_shader.cpp make_module), which no guard covered (pipelines have
+// guarded_graphics / guarded_compute). Its pointer goes through this guard now: a fault is that shader failing (the translator
+// takes a null module for a failed program), logged with the SPIR-V kept beside the game for us (the first two), and said once in
+// a box, with what it likely means on a GPU below the minimum. RX_VK_NO_MODULE_GUARD=1: the driver's pointer as before
+bool amd_gcn = false;   // (an AMD GPU with only 64-lane subgroups and no mesh shaders: GCN, RX 400 / 500 / Vega; create_device)
+#ifdef _WIN32
+PFN_vkCreateShaderModule driver_create_shader_module = nullptr;
+std::atomic<int> module_faults{0};
+__declspec(noinline) VkResult module_call(VkDevice d, const VkShaderModuleCreateInfo* ci, const VkAllocationCallbacks* a,
+                                          VkShaderModule* m, int* faulted) {
+    __try {
+        return driver_create_shader_module(d, ci, a, m);
+    } __except (GetExceptionCode() == EXCEPTION_ACCESS_VIOLATION || GetExceptionCode() == EXCEPTION_ILLEGAL_INSTRUCTION ||
+                        GetExceptionCode() == EXCEPTION_INT_DIVIDE_BY_ZERO ? 1 : 0) {
+        *faulted = 1;
+        return VK_ERROR_UNKNOWN;
+    }
+}
+void module_fault(const VkShaderModuleCreateInfo* ci) {
+    const int n = ++module_faults;
+    char saved[MAX_PATH + 48] = "";
+    if (n <= 2 && ci && ci->pCode && ci->codeSize) {   // (the SPIR-V the driver could not take: spirv-val / spirv-dis it here)
+        char path[MAX_PATH];
+        std::string dir(path, game_module_path(path, MAX_PATH));
+        dir = dir.substr(0, dir.find_last_of("\\/") + 1);
+        snprintf(saved, sizeof saved, "%shookshot_driver_fault_%d.spv", dir.c_str(), n);
+        if (FILE* f = fopen(saved, "wb")) fwrite(ci->pCode, 1, ci->codeSize, f), fclose(f);
+        else saved[0] = 0;
+    }
+    if (n <= 8 || (n & (n - 1)) == 0)
+        logf("vk: THE GRAPHICS DRIVER CRASHED reading a shader (vkCreateShaderModule, %zu bytes of SPIR-V%s%s): it is left out "
+             "(%d so far)", ci ? (size_t)ci->codeSize : 0, saved[0] ? ", kept as " : "", saved, n);
+    if (n != 1 || dev.offscreen || env_on("HOS_HEADLESS")) return;
+    std::thread([name = std::string(dev.props.deviceName), old = !dev.mesh_shader] {
+        std::string text = "The graphics driver of your " + name + " crashed while Hookshot handed it one of the game's shaders. "
+            "Hookshot leaves such shaders out and goes on, but parts of the picture may be missing, and the driver may fail again.";
+        if (old)
+            text += "\n\nThis card has no mesh shaders and is below what Hookshot supports (NVIDIA GeForce RTX 20 series or newer, "
+                    "AMD Radeon RX 6000 series or newer, or Intel Arc). Updating its driver is worth a try, but it may not run "
+                    "the game.";
+        text += "\n\nIf you report it on Hookshot's GitHub page, please attach hookshot_log.txt and the hookshot_driver_fault_1.spv file "
+                "from the game folder.";
+        MessageBoxA(nullptr, text.c_str(), "Hookshot: graphics driver", MB_OK | MB_ICONWARNING | MB_TOPMOST);
+    }).detach();
+}
+VKAPI_ATTR VkResult VKAPI_CALL guarded_create_shader_module(VkDevice d, const VkShaderModuleCreateInfo* ci,
+                                                            const VkAllocationCallbacks* a, VkShaderModule* m) {
+    int faulted = 0;
+    const VkResult r = module_call(d, ci, a, m, &faulted);
+    if (faulted) {
+        if (m) *m = VK_NULL_HANDLE;
+        module_fault(ci);
+    }
+    return r;
+}
+void guard_shader_modules() {
+    if (env_on("RX_VK_NO_MODULE_GUARD") || !vkx::vkCreateShaderModule) return;
+    driver_create_shader_module = vkx::vkCreateShaderModule;
+    vkx::vkCreateShaderModule = guarded_create_shader_module;
+}
+#else
+void guard_shader_modules() {}
+#endif
 
 bool has_extension(const std::vector<VkExtensionProperties>& all, const char* name) {
     for (const auto& e : all)
@@ -363,6 +435,7 @@ bool create_device() {
     optional(VK_EXT_SHADER_STENCIL_EXPORT_EXTENSION_NAME, dev.stencil_export);
     optional(VK_EXT_MEMORY_BUDGET_EXTENSION_NAME, dev.memory_budget);
     optional(VK_EXT_IMAGE_2D_VIEW_OF_3D_EXTENSION_NAME, dev.view_2d_of_3d);
+    dev.pci_bus_info = has_extension(exts, VK_EXT_PCI_BUS_INFO_EXTENSION_NAME);   // (properties only: nothing to enable)
     // (hookshot) on by default: with a marker before each draw and dispatch the device has not been lost (five
     // runs); without them it was, every run, shortly after OoT's first gameplay frames (nvlddmkm event 153; the
     // extension alone, RX_VK_CHECKPOINTS=ext, did not keep it). The race they hide is not found yet.
@@ -390,6 +463,31 @@ bool create_device() {
     bool atomic_float = false;
     if (fadd_wanted) optional(VK_EXT_SHADER_ATOMIC_FLOAT_EXTENSION_NAME, atomic_float);
     optional(VK_KHR_SWAPCHAIN_MUTABLE_FORMAT_EXTENSION_NAME, dev.swap_mutable);   // (hookshot: the overlays, vk_imgui.cpp)
+    if (getenv("RX_VK_TL") || getenv("RX_VK_TL_S")) optional(VK_EXT_CALIBRATED_TIMESTAMPS_EXTENSION_NAME, dev.calibrated_ts);   // (stream R2: the timeline's GPU side)
+#ifndef _WIN32
+    // (Linux) tl_gpu_dump asks for the device's and the host clock's time (vk_tl_clock.h: CLOCK_MONOTONIC, the shim's
+    // QueryPerformanceCounter); a domain the device does not list may not be asked for, so the GPU side (and RX_VK_TL_PROBE) is off
+    if (dev.calibrated_ts) {
+        const auto domains_fn = (PFN_vkGetPhysicalDeviceCalibrateableTimeDomainsEXT)instance_proc()(dev.instance, "vkGetPhysicalDeviceCalibrateableTimeDomainsEXT");
+        uint32_t nd = 0;
+        VkTimeDomainEXT domains[16];
+        if (domains_fn && domains_fn(dev.physical, &nd, nullptr) == VK_SUCCESS) {
+            nd = std::min<uint32_t>(nd, 16);
+            if (domains_fn(dev.physical, &nd, domains) < 0) nd = 0;
+        } else {
+            nd = 0;
+        }
+        std::string names;
+        for (uint32_t i = 0; i < nd; i++) names += std::string(i ? ", " : "") + tl_time_domain_name(domains[i]);
+        if (tl_time_domains_usable(domains, nd)) {
+            logf("vk: tl: GPU side calibrated against %s (domains: %s)", tl_time_domain_name(tl_host_time_domain()), names.c_str());
+        } else {
+            logf("vk: tl: GPU side off: the device lists no %s time domain beside DEVICE (domains: %s)", tl_time_domain_name(tl_host_time_domain()),
+                 names.empty() ? "none" : names.c_str());
+            dev.calibrated_ts = false;
+        }
+    }
+#endif
     dlss_device_extensions(want, exts);   // (hookshot: NVIDIA DLSS's, vk_dlss.cpp)
     dlss_fg_device_extensions(want, exts);   // (hookshot: NVIDIA DLSS Frame Generation's through NGX, asked of NGX)
     bool fsr_descriptor_buffer = false;   // (hookshot, linux: only with a Vulkan FSR 4 library beside the game, vk_fsr4.cpp)
@@ -411,8 +509,10 @@ bool create_device() {
     const float priority = 1.0f;
     VkDeviceQueueCreateInfo q{VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO};
     q.queueFamilyIndex = dev.queue_family;
+    const float replay_priorities[2] = {getenv("RX_VK_QUEUE_PRIO") ? (float)atof(getenv("RX_VK_QUEUE_PRIO")) : 1.0f, 1.0f};   // (stream R2: RX_VK_QUEUE_PRIO, a diagnostic)
     q.queueCount = 1;
-    q.pQueuePriorities = &priority;
+    if (getenv("RX_VK_TL_PROBE") && atoi(getenv("RX_VK_TL_PROBE")) >= 2 && families[dev.queue_family].queueCount >= 2) q.queueCount = 2;   // (stream R2)
+    q.pQueuePriorities = replay_priorities;
     // (hookshot) The presents on a queue of a compute family of their own, beside the replay's (RX_VK_PRESENT_QUEUE=1 / 0: on /
     // off; on by default with NVIDIA's driver on Windows, where it was measured). On the replay's queue vkQueuePresentKHR blocked
     // with dev.present_mu held, ~0.8 ms a present with frame interpolation at 4x and up to 8, and the game's main and presentation
@@ -434,6 +534,12 @@ bool create_device() {
         (void)dp;       //  NVIDIA's driver on Windows. RX_VK_PRESENT_QUEUE=1: on)
 #endif
         if (const char* e = getenv("RX_VK_PRESENT_QUEUE")) want = atoi(e) != 0;
+        // (hookshot: ReShade, and RenoDX through it, draws its effects and its HDR pass on the queue the presents are made on: a
+        // compute family's has no graphics, and ReShade turns itself off there. reshade_compat)
+        if (want && reshade_compat()) {
+            want = false;
+            logf("vk: ReShade / RenoDX: the presents stay on the graphics queue (RX_VK_PRESENT_QUEUE left off)");
+        }
         for (uint32_t i = 0; want && i < n && compute_family == UINT32_MAX; i++)
             if ((families[i].queueFlags & VK_QUEUE_COMPUTE_BIT) && !(families[i].queueFlags & VK_QUEUE_GRAPHICS_BIT))
                 compute_family = i;
@@ -622,6 +728,18 @@ bool create_device() {
              drv.driverName, drv.driverInfo, (int)dev.fixes.fetch_bounds, (int)dev.fixes.nan_bits, (int)dev.fixes.gather_offset);
     }
     dev.eds3_a2c = dev.dynamic_state3 && eds3.extendedDynamicState3AlphaToCoverageEnable;
+    {   // (hookshot) which denorm modes a shader may declare: all programs say them, and not every device has them (strip_float_controls)
+        VkPhysicalDeviceVulkan12Properties p12{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_PROPERTIES};
+        VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+        p2.pNext = &p12;
+        vkGetPhysicalDeviceProperties2(dev.physical, &p2);
+        dev.denorm_preserve_widths = (p12.shaderDenormPreserveFloat16 ? 1u : 0u) | (p12.shaderDenormPreserveFloat32 ? 2u : 0u) |
+                                     (p12.shaderDenormPreserveFloat64 ? 4u : 0u);
+        dev.denorm_flush_widths = (p12.shaderDenormFlushToZeroFloat16 ? 1u : 0u) | (p12.shaderDenormFlushToZeroFloat32 ? 2u : 0u) |
+                                  (p12.shaderDenormFlushToZeroFloat64 ? 4u : 0u);
+        logf("vk: float controls: denorm preserve widths %#x, flush to zero %#x (modes the device lacks are taken out of the shaders)",
+             dev.denorm_preserve_widths, dev.denorm_flush_widths);
+    }
     dev.vk12 = f12;
     dev.vk13 = f13;
     {   // (hookshot, after TotK Recomp's vk_caps.c) NVN's programs are written for 32 lanes: the translator is told 32, and the lane
@@ -645,6 +763,7 @@ bool create_device() {
         dev.radv_gcn = drv.driverID == VK_DRIVER_ID_MESA_RADV && !f11.storageInputOutput16;
         logf("vk: subgroups: default %u lanes, %u-%u, pinned to 32 on stages %#x; RADV on GCN 1-4: %s", sg.subgroupSize, sc.minSubgroupSize,
              sc.maxSubgroupSize, (unsigned)dev.sg32_stages, dev.radv_gcn ? "yes" : "no");
+        amd_gcn = dev.props.vendorID == 0x1002 && sc.minSubgroupSize == 64 && sc.maxSubgroupSize == 64;
     }
     if (!f13.dynamicRendering || !f13.synchronization2 || !f12.timelineSemaphore) {
         logf("vk: the GPU lacks dynamic rendering, synchronization2 or timeline semaphores");
@@ -672,6 +791,9 @@ bool create_device() {
     logf("vk: mesh shaders: %s, from %s: %s", mesh_mode == 2 ? "Compute" : mesh_mode == 1 ? "Native" : "Automatic",
          mesh_choice.why, dev.mesh_shader ? (dev.task_mesh_fallback ? "native, task + mesh draws on the compute path" : "native")
                          : dev.mesh_fallback ? "the compute path" : "none");
+    if (amd_gcn && !dev.mesh_shader)   // (hookshot)
+        logf("vk: an AMD GCN GPU (Radeon RX 400 / 500 series or Vega: 64-lane subgroups only, no mesh shaders): below what Hookshot "
+             "supports (an RX 570's driver closed the game during its shader preparation)");
     if (robust) logf("vk: robust buffer access %s", robust_ok ? "on" : "not supported");
     f.features.robustBufferAccess = robust_ok ? VK_TRUE : VK_FALSE;   // (off by default: the game's accesses stay in their buffers)
     dev.features = f.features;
@@ -690,7 +812,22 @@ bool create_device() {
     ci.pQueueCreateInfos = qs.data();
     ci.enabledExtensionCount = (uint32_t)want.size();
     ci.ppEnabledExtensionNames = want.data();
-    if (vkCreateDevice(dev.physical, &ci, nullptr, &dev.device) != VK_SUCCESS) {
+#ifndef _WIN32
+    {   // (Linux) Mesa's submit thread, read by Mesa in this vkCreateDevice: decided at process start, before any thread, and
+        // set for the whole process (host/hos_submit_thread.h, hos_main.c submit_thread_at_start): only said here, with the
+        // device now known. Nothing to say without an AMD card (the host's note is empty) or an older host (no note)
+        using Note = const char* (*)();
+        const Note note = (Note)dlsym(RTLD_DEFAULT, "hos_posix_submit_thread_note");
+        const char* said = note ? note() : nullptr;
+        if (said && *said) {
+            if (fadd_driver.driverID == VK_DRIVER_ID_MESA_RADV) logf("vk: RADV: Mesa's submit thread %s (decided at start)", said);
+            else logf("vk: the picked device is not RADV (driver %d): Mesa's submit thread was decided at start for the AMD card (%s), "
+                      "it reaches this device only if it is another Mesa driver", (int)fadd_driver.driverID, said);
+        }
+    }
+#endif
+    const VkResult created = vkCreateDevice(dev.physical, &ci, nullptr, &dev.device);
+    if (created != VK_SUCCESS) {
         logf("vk: vkCreateDevice failed");
         return false;
     }
@@ -700,7 +837,10 @@ bool create_device() {
     // (hookshot: when programs are loaded, vk_programs.h. Without mesh shaders, or with the task + mesh draws through the
     // fallback, a start keeps the fallback's programs ready, and loads at create have not been shown to be as good there)
     programs_load_decide(dev.mesh_shader && !dev.mesh_fallback && !dev.task_mesh_fallback);
+    guard_shader_modules();   // (hookshot)
     vkGetDeviceQueue(dev.device, dev.queue_family, 0, &dev.queue);
+    dev.probe_queue = VK_NULL_HANDLE;
+    if (q.queueCount >= 2) vkGetDeviceQueue(dev.device, dev.queue_family, 1, &dev.probe_queue);
     dev.sparse_queue = VK_NULL_HANDLE;
     if (dev.sparse_buffers) {
         if (own_family_sparse) dev.sparse_queue = dev.queue;
@@ -728,6 +868,9 @@ bool create_device() {
     coopmat_init();
     reflex_device_created();
     antilag_device_created();
+    // (hookshot: on the Steam Deck the GPU held at amdgpu's peak power state while the game runs (RX_VK_GPU_CLOCK=0: not), gpu_clock.h;
+    // the device's render node from VK_EXT_physical_device_drm, which needs no enabling to be asked)
+    gpu_clock_device_created(has_extension(exts, VK_EXT_PHYSICAL_DEVICE_DRM_EXTENSION_NAME));
     if (dev.push_descriptor) {
         VkPhysicalDevicePushDescriptorPropertiesKHR pp{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PUSH_DESCRIPTOR_PROPERTIES_KHR};
         VkPhysicalDeviceProperties2 p2{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
@@ -786,6 +929,25 @@ void swap_views_make(VkImageUsageFlags usage, VkFormat format) {
 /// (hookshot) Frame generation as the swapchain is made for it: the fixed multiplier, 2 to 4 (more takes no more images), or 0
 /// for off and Auto. Its present mode under V-Sync Auto and its spare images follow it; present_image makes the swapchain
 /// again when it changes
+bool reshade_compat() {
+    // (asked when the device is made, after the instance: ReShade's Vulkan layer, an implicit layer the ReShade installer registers
+    // for hookshot.exe, has loaded its DLL by then)
+    static int on = -1;
+    if (on >= 0) return on != 0;
+    const char* e = getenv("RX_VK_RESHADE");
+    if (e && *e) {
+        on = env_on("RX_VK_RESHADE");
+    } else {
+#ifdef _WIN32
+        on = GetModuleHandleA("ReShade64.dll") != nullptr || GetModuleHandleA("ReShade.dll") != nullptr;
+#else
+        on = 0;
+#endif
+    }
+    if (on) logf("vk: ReShade / RenoDX compatibility on (%s): presents on the graphics queue, the swapchain's images drawable",
+                 e && *e ? "RX_VK_RESHADE" : "ReShade's layer is loaded");
+    return on != 0;
+}
 int swapchain_framegen() { return opts.framegen >= 2 ? std::min(opts.framegen, 4) : 0; }
 
 /// (hookshot) Whether the swapchain is made for NVIDIA DLSS Frame Generation: a fixed multiplier, and DLSS-G making the sets
@@ -847,10 +1009,16 @@ bool create_swapchain(uint32_t width, uint32_t height) {
         return false;
     }
     if (caps.currentExtent.width != UINT32_MAX) width = caps.currentExtent.width, height = caps.currentExtent.height;
-    logf("vk: surface caps images %u..%u extent %ux%u..%ux%u usage %#x alpha %#x transform %#x",
-         caps.minImageCount, caps.maxImageCount, caps.minImageExtent.width, caps.minImageExtent.height,
-         caps.maxImageExtent.width, caps.maxImageExtent.height, caps.supportedUsageFlags,
-         caps.supportedCompositeAlpha, caps.supportedTransforms);
+    // (a minimised window has a 0x0 surface and the game presents every frame: said once, not a thousand times)
+    static bool told_empty;
+    if (width && height) told_empty = false;
+    if ((width && height) || !told_empty) {
+        told_empty = !width || !height;
+        logf("vk: surface caps images %u..%u extent %ux%u..%ux%u usage %#x alpha %#x transform %#x",
+             caps.minImageCount, caps.maxImageCount, caps.minImageExtent.width, caps.minImageExtent.height,
+             caps.maxImageExtent.width, caps.maxImageExtent.height, caps.supportedUsageFlags,
+             caps.supportedCompositeAlpha, caps.supportedTransforms);
+    }
     if (!(caps.supportedUsageFlags & VK_IMAGE_USAGE_TRANSFER_DST_BIT)) {
         logf("vk: surface does not support transfer-destination swapchain images");
         return false;
@@ -955,6 +1123,9 @@ bool create_swapchain(uint32_t width, uint32_t height) {
     // (hookshot) the overlays Dear ImGui draws (vk_imgui.cpp) render into it. Every surface allows it (the Vulkan spec)
     if (caps.supportedUsageFlags & VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT)
         ci.imageUsage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+    // (hookshot) ReShade / RenoDX: their effects and RenoDX's HDR output pass also sample the swapchain's images (reshade_compat;
+    // not storage: an sRGB swapchain format has no storage use, whatever the surface lists, and the swapchain would fail)
+    if (reshade_compat() && (caps.supportedUsageFlags & VK_IMAGE_USAGE_SAMPLED_BIT)) ci.imageUsage |= VK_IMAGE_USAGE_SAMPLED_BIT;
     ci.preTransform = caps.currentTransform;
     ci.compositeAlpha = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR;
     if (!(caps.supportedCompositeAlpha & ci.compositeAlpha)) {
@@ -1220,6 +1391,7 @@ void prepare_with_screen() {
         }
         if (update) prep_skip[0].store(true), prep_skip[1].store(true);
         const bool prepared = !update && prepare_run(prep_progress, false);
+        if (!update && !prepared && !prepare_stopped() && state_list_pending()) state_list_run();
         if (!prepared) prep_skip[0].store(true);
         // (a first start, or one after a start that did not finish them: the pipelines the notes predict, into the driver's cache)
         if ((prepared || (!update && predict_pending())) && compile_all() && !prepare_stopped()) {
@@ -1367,6 +1539,7 @@ bool started_up() {
         // (no prediction: its part of the bar goes. On Most after a preparation too: left in, the step to the noted pipelines
         // counted it done at its guess, and the bar jumped by the prediction's share, about half of it)
         if (!predict) bar.skip(1);
+        if (!prepared && state_list_pending()) state_list_run();   // (the builder's step: a list shipped after the last prepare)
         part = 1;
         prepare_moved(1, 0, 0);
         if (predict) predict_run(progress);
@@ -1436,6 +1609,7 @@ bool started_up() {
         };
         const bool update = prepare_is_update();   // (an update: what the notes name now, the rest in play)
         if (!update && (prepare_run(progress, false) || predict_pending()) && compile_all()) predict_run(progress);
+        else if (!update && state_list_pending()) state_list_run();
         if (update) state_list_run();
         precompile_run(progress);
         if (update) prepare_background();
@@ -1504,7 +1678,7 @@ void auto_profile() {
     hw.integrated = p.deviceType == VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU;
     for (uint32_t i = 0; i < dev.memory.memoryHeapCount; i++)
         if (dev.memory.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT)
-            hw.vram_mb = std::max<uint32_t>(hw.vram_mb, (uint32_t)(dev.memory.memoryHeaps[i].size >> 20));
+            hw.vram_mb = std::max<uint32_t>(hw.vram_mb, (uint32_t)(test_vram_bytes(dev.memory.memoryHeaps[i].size) >> 20));
     hw.mesh_native = dev.mesh_capable;   // (the card's, not this run's mode: Linux AMD's Automatic is Compute, #2245)
     hw.mesh_as_compute = dev.mesh_capable && !dev.mesh_shader;
     hw.rtx = hw.vendor == ::auto_settings::NVIDIA && strstr(p.deviceName, "RTX");

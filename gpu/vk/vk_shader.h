@@ -107,6 +107,10 @@ struct Program {
     // bound (the pipeline state list, vk_draw.cpp)
     std::vector<uint8_t> questions;
     uint64_t codes[4]{};   // (hookshot) its stages' code keys: vertex (mesh), fragment, task, the header-only stage (the state list)
+    // (hookshot, RX_VK_SHADER_KEY) a hash of what the driver compiles for this program: each stage's SPIR-V, the descriptor counts the
+    // layout is made from, the push and vertex-input facts the pipeline reads. 0: not taken (switch off). The same program, translated by
+    // another translator to the same SPIR-V, has the same one: vk_draw.cpp's ledger of what the driver compiled goes by it
+    uint64_t fp = 0;
     // (hookshot) a compute program read from the cache without its code (vk_progcache.cpp program_cache_read_light): where its
     // SPIR-V is in hookshot_programs.bin, and how many words; 0 words: it has its module (program_cache_complete makes it)
     int64_t code_at = 0;
@@ -129,6 +133,16 @@ void program_load_async_here(bool on);
 /// (hookshot) a cached program's stand-in: once ready (and failed), its records are read and the draw picks again
 bool program_is_stand_in(const Program* p);
 uint64_t program_cache_stamp();   // (what the kept programs and pipelines are good for)
+size_t program_cache_kept();   // (hookshot) program keys in the cache now, SIZE_MAX: no cache
+/// (hookshot) RX_VK_SHADER_KEY (default on, 0: off): programs get a fingerprint of what the driver compiles, and a start after a translator
+/// change builds again only what the fingerprints say the driver has not seen (vk_draw.cpp, the compiled ledger)
+bool shader_key_on();
+/// (hookshot, RX_VK_SHADER_KEY) A program was translated here and has this fingerprint (vk_draw.cpp: the ledger lists it as seen, so that
+/// the next start after a translator change can tell by a sample of programs how many of them come out differently)
+void program_fingerprinted(uint64_t fp);
+size_t program_cache_kept();   // (hookshot) program keys in the cache now, SIZE_MAX: no cache
+/// (hookshot) RX_VK_MESH_FB_LAYOUT, read once (mesh_mode.h mesh_rule::fb_layout): the compute fallback's record layout
+uint32_t mesh_fallback_layout();
 size_t program_cache_load_some(const std::unordered_set<uint64_t>& wanted, const std::function<void(Program&)>& fn,
                                bool computes = true, bool fallbacks = false);   // (computes: and every kept compute program)
 /// The precompile of every shader of the game (hookshot_shaders.bin, from nx2/shader_census.py): how many programs it names, 0: none
@@ -176,6 +190,8 @@ bool program_modules_dropped(const Program& p);
 /// (hookshot) Every kept graphics and mesh program's key, in the file's order, no record read; *loaded: the variants in memory already
 std::vector<uint64_t> program_cache_keys(std::vector<Program*>* loaded);
 const Program* program_find(uint64_t key, uint64_t variant);
+/// (hookshot) Whether the program cache or memory holds this variant of key already (the records are read as far as their answers)
+bool program_variant_kept(uint64_t key, uint64_t variant);
 /// (hookshot) The pipeline state list's variants, the same on every GPU: the answers with their stages numbered without the mesh
 /// fallback's generated vertex stage, and their hash (a graphics or native mesh program's: its own); a loaded variant by that hash
 std::vector<Program::Answer> answers_portable(const Program& p);

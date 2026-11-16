@@ -59,7 +59,7 @@ fixture = r'''
 using VkSemaphore=uint64_t; using VkImage=uint64_t; using VkSwapchainKHR=uint64_t; using VkResult=int;
 constexpr uint64_t VK_NULL_HANDLE=0;
 constexpr int VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO=1, VK_SUCCESS=0;
-constexpr VkResult VK_ERROR_SURFACE_LOST_KHR = -1000000000;
+constexpr VkResult VK_ERROR_SURFACE_LOST_KHR = -1000000000, VK_SUBOPTIMAL_KHR = 1000001003, VK_ERROR_OUT_OF_DATE_KHR = -1000001004;
 constexpr int VK_PRESENT_MODE_MAILBOX_KHR=1, VK_PRESENT_MODE_IMMEDIATE_KHR=2;
 struct VkSemaphoreCreateInfo { int type; };
 struct Extent { uint32_t width,height; };

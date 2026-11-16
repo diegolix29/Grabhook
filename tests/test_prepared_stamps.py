@@ -64,6 +64,7 @@ def main():
 #include <filesystem>
 #include <string>
 #include <vector>
+size_t program_cache_kept() { return SIZE_MAX; }   // (vk_shader.h: no program cache here)
 """ + helpers + r"""
 int main(int argc, char** argv) {
     const std::string dir = argv[1], path = dir + "/hookshot_prepared.bin", seed = dir + "/hookshot_shaders.bin";
@@ -92,8 +93,8 @@ int main(int argc, char** argv) {
     prepared_write(path, w);
     uint64_t first = 0;
     FILE* f = fopen(path.c_str(), "rb");
-    if (fread(&first, 8, 1, f) != 1 || first != 0xAAAA || size_of() != 48)   // (prepare_is_update reads the first 8 bytes alone)
-        std::puts("the file: wanted 48 bytes, the translator's stamp first"), fails++;
+    if (fread(&first, 8, 1, f) != 1 || first != 0xAAAA || size_of() != 56)   // (prepare_is_update reads the first 8 bytes alone)
+        std::puts("the file: wanted 56 bytes, the translator's stamp first"), fails++;
     fclose(f);
     if (prepared_read(path, &p) != 2 || p.stamp != 0xAAAA || p.seed_hash != 7 || p.seed_size != 8 || p.seed_time != 9 || p.warmed != 0xBBBB)
         std::puts("written and read: wanted every word back"), fails++;

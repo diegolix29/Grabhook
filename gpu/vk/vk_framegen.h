@@ -11,8 +11,10 @@ bool framegen_on();
 /// interpolation cannot run (the present goes to the window as without it)
 bool framegen_record(VkCommandBuffer cmd, VkImageView src, uint32_t sw, uint32_t sh, const int crop[4], float cover, bool native_pq);
 /// (hookshot) Who made the made frames of the sets shown lately (the last 64, about a second at 60): what the Insert menu's
-/// Frame generation by row and the FPS counter name. None: none made (Off, nothing to blend from, none for half a second)
-enum class FgMaker { None, BuiltIn, Dlss, Fsr3 };
+/// Frame generation by row and the FPS counter name. None: none made (Off, nothing to blend from, none for half a second).
+/// DlssPaused: DLSS FG chosen, and the sets were the game's frames alone, with no Upscaler picture to make frames from (the
+/// game's own menus, movies and loading screens: vk_dlss.cpp dlss_fg_holds)
+enum class FgMaker { None, BuiltIn, Dlss, Fsr3, DlssPaused };
 FgMaker framegen_maker();
 /// The first frame the last framegen_record made (null when it made none), w x h, GENERAL
 VkImage framegen_made_image(uint32_t* w, uint32_t* h);
@@ -55,5 +57,16 @@ void wide_sides_tick(float cover);
 float wide_cover_sample();
 /// Whether ultrawide's menu sides can show at all: Ultrawide with a margin and the Insert menu's setting on
 bool wide_sides_possible();
+/// (hookshot) The Gameplay tab's Item wheel row is on (off by default; HOS_ITEM_WHEEL over it). While it is
+/// false the two below record nothing and make nothing
+bool framegen_wheel_on();
+/// With the Item wheel row on: the gameplay upscale's output (image, its view format, w x h at level, GENERAL) as the upscale
+/// left it, the scene before the game draws its HUD on it, copied in the frame's own work (the game stops drawing its scene
+/// while its item row is shown: the frame before the row opens is the backdrop)
+void framegen_wheel_scene(VkCommandBuffer cmd, VkImage image, VkFormat format, uint32_t w, uint32_t h, uint32_t level);
+/// While the item wheel is open: the window texture's crop (dst, GENERAL, the game's RGBA8 picture) covered with the scene
+/// framegen_wheel_scene last copied, blurred and dimmed, and the wheel (vk_wheel.cpp) over it. False (nothing recorded) when
+/// the wheel is closed, no scene was copied since the row was turned on, or the picture is not that scene's
+bool framegen_wheel_backdrop(VkCommandBuffer cmd, VkImage dst, VkFormat format, uint32_t sw, uint32_t sh, const int crop[4]);
 
 } // namespace mkwvk

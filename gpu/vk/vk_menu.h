@@ -10,8 +10,10 @@ namespace mkwvk {
 // (out of the box every feature is off: what the game does on its own. The ini beside the executable keeps a player's choices)
 struct Options {
     int framegen = 0;     // made frames: 0 off, 1 Auto (to the display's refresh), or 2 to 8 times the game's frames
-    int framegen_by = 0;  // (hookshot) who makes them at 2x and up: 0 Auto (NVIDIA DLSS Frame Generation where it runs, else the
-                          // renderer's own), 1 the renderer's own (vk_framegen.cpp; vk_dlss.cpp dlss_fg_wanted)
+    int framegen_by = 0;  // (hookshot) who makes them at 2x and up: 0 DLSS FG (NVIDIA DLSS Frame Generation), 1 Built-in FG
+                          // (the renderer's own, vk_framegen.cpp; vk_dlss.cpp dlss_fg_wanted). Where DLSS-G cannot run, the
+                          // row has Built-in FG alone and keeps the 0 saved. An options file's 0 from before was Auto, DLSS FG
+                          // where it runs: the same default
     int pace = 0;         // frames shown on an even line (vk_framegen.cpp)
     int vsync = 0;        // (hookshot) V-Sync, the swapchain's present mode (vk_main.cpp create_swapchain, made again at once): 0 Auto
                           // (mailbox where the driver has it), 1 On (FIFO), 2 Off (immediate). RX_VK_FIFO / RX_VK_IMMEDIATE over it
@@ -38,8 +40,9 @@ struct Options {
     int dlss = 0;         // the Upscaler (its name from before FSR: options files and the tests' stand-ins keep it): 0 the game's
                           // own network, 1 NVIDIA DLSS, 2 NVIDIA DLAA (a build with NVIDIA's SDK only), 3 AMD FSR 3.1 (vk_fsr3.cpp),
                           // 4 AMD FSR 4, 5 its native AA (a build with FSR 4 only). upscaler_rows.h; vk_temporal.cpp. Saved as dlss
-    int dlss_model = 0;   // DLSS's network, by its preset: 0 K (transformer), 1 M, 2 L (second-generation transformer), 3 NVIDIA's
-                          // default (upscaler_rows.h model_preset; vk_dlss.cpp). RX_VK_DLSS_PRESET over it
+    int dlss_model = 0;   // DLSS's network, by its preset: 0 K (transformer; E, the CNN, under 7 GB of video memory), 1 M, 2 L
+                          // (second-generation transformer), 3 NVIDIA's default (upscaler_rows.h model_preset; vk_dlss.cpp).
+                          // RX_VK_DLSS_PRESET over it
     int sharpness = 0;    // 0 to 100
     int texture_detail = 0;   // (hookshot) Texture detail: 0 Auto, 1 Full, 2 Medium, 3 Low (the big textures' top levels left out,
                               // gpu/vk/vk_texture.cpp texture_detail_dims; read as each texture is made)
@@ -75,6 +78,7 @@ struct Options {
     int auto_run = 0;  // (hookshot) Auto run: A (the sprint) kept held after it is let go (host/auto_run.h)
     int mouse_sens = 100; // the mouse's sensitivity in percent: 0.1 degrees a count at 100 with native look (host/nn_hid.c)
     int mouse_invert = 0; // the mouse's up and down swapped
+    int mouse_invert_x = 0; // the mouse's left and right swapped (HOS_OPT_MOUSE_INVERT_X, 61)
     int walk_mode = 0;    // (hookshot) the Walk key (the Controls page): 0 Link walks while it is held, 1 one press walks and the next
                           // runs again (host/nn_hid.c walk_held: HOS_OPT_WALK_MODE, 49)
     int walk_speed = 45;  // (hookshot) how far the movement keys tilt the left stick while Link walks, percent, 15 to 90
@@ -126,7 +130,12 @@ struct Options {
     int menu_lang = 0;    // this menu's language: 0 Auto (the game's own, language.txt), else menu_i18n::kLangs[menu_lang - 1]
                           // (vk_menu_i18n.cpp). Saved as menu_language
     int mic = 1;          // (hookshot) the ocarina's microphone: 0 Off, 1 the system's default, 2.. a device as host->mic_name lists it (host/nn_audio_in.c)
+    int microphone_gain = 100; // software capture gain, 0..400%; leaves the system's input volume alone
     int skip_title = 0;   // (hookshot) start with the most recent save, pressing through the title and its file list (host/oot_autoload.c); read at the start
+    int item_wheel = 0;   // (hookshot) R or L held shows the item row as a wheel (host/oot_wheel.c, vk_wheel.cpp); HOS_ITEM_WHEEL over it
+    int cycle_items = 0;  // (hookshot) a tap of R or L changes the ZR item: 0 off (the default: R and L as the game has them),
+                          // 1 Last used (the item on ZR before this one), 2 Basic, 3 +Bombs, 4 +Tools (within the ZR item's
+                          // group; host/oot_wheel.c cycle_level)
 };
 extern Options opts;
 constexpr int kAutoPreset = 6;   // (the Quality preset Auto (this PC): menu_auto_for_gpu, auto_settings.h)
@@ -164,6 +173,11 @@ int menu_shadow_res();   // (Shadow resolution, HOS_OPT_SHADOW_RES: the size dra
 int menu_damage_taken();   // (Damage taken, HOS_OPT_DAMAGE_TAKEN: 1, Normal, while the tools are off)
 int menu_take_cheat_action();
 void menu_note_frame(bool game_frame, int shown = 1);   // (the frame rates the FPS counter shows)
+int menu_item_count(int i);   // (hookshot) the game side's count of oot_cheat_items.h's item i, -1 unknown: the item wheel's numbers
+int menu_link_age();          // (hookshot) Link's age as the game side said it: 0 child, 1 adult, -1 unknown
+int menu_take_capture_request();   // (hookshot, vk_replay.cpp: a place whose picture the Travel page wants now, -1 none)
+void menu_store_capture(int place, const uint8_t* rgba, uint32_t w, uint32_t h);   // (that picture, RGBA: to the picture worker)
+bool menu_teleport_captures_on();   // (hookshot: whether the Travel page's pictures are taken: the game side watches only then)
 /// The game's picture's size (the Output resolution, its crop) and the window's, at each present: the Window scaling filter
 /// row says when it is not needed
 void menu_note_present_sizes(uint32_t picture_w, uint32_t picture_h, uint32_t window_w, uint32_t window_h);

@@ -20,6 +20,7 @@
    same functions as the proc table (nvn2_dispatch, from gen/nvn2_exports.c). */
 #include "hos.h"
 #include "../gpu/render/rx_nvn.h"
+#include "hl/c/hl_gfx_rec.h"   /* (Hookshot: the records native producers write, checked against rx_nvn.h below) */
 #include "../gpu/vk/vk_api.h"   /* (HOS_OPT_RENDER_THREAD: the present poll, nvnEventGetValue) */
 #include <stdio.h>
 #include <stdlib.h>
@@ -156,16 +157,19 @@ int nvn_gpu_read(uint64_t gpu, void *dst, uint64_t n) {
     }
     return 1;
 }
+void hos_noaccess_write(int begin);   /* (hos_memsplit.c, HOS_NOACCESS_RAM: no zero page given back under this write) */
 int nvn_gpu_write(uint64_t gpu, const void *src, uint64_t n) {
     const uint8_t *s = (const uint8_t *)src;
+    hos_noaccess_write(1);
     while (n) {
         const uint64_t k = nvn_gpu_contiguous(gpu, n);
         uint8_t *d = k ? nvn_gpu_host(gpu) : NULL;
-        if (!d) return 0;
+        if (!d) { hos_noaccess_write(0); return 0; }
         memcpy(d, s, k);
         HOS_WRITTEN(d, (size_t)k);
         s += k, gpu += k, n -= k;
     }
+    hos_noaccess_write(0);
     return 1;
 }
 
@@ -348,10 +352,19 @@ NV(nvnMemoryPoolFinalize) {
         }
         InterlockedIncrement(&vmap_gen);
         ReleaseSRWLockExclusive(&vmap_lock);
-    } else if (o->mem) {
+    } else if (o->mem && o->magic == NVN_MAGIC('P', 'O', 'O', 'L')) {
         hos_gpu_track(o->gpu, o->size, 0);
         void hos_prompts_pool_gone(uint64_t mem);   /* (hookshot, prompts.c: the prompts' textures no longer written there) */
         hos_prompts_pool_gone(o->mem);
+    } else if (o->mem) {
+        /* (Hookshot, 2026-11-14) a pool object finalized again (its magic gone with the first Finalize): its range was untracked
+           then, and untracking it again took the counted entry of a newer live pool made over the same memory since (the
+           actor heap's small pools are made again at the same addresses): the back end's lazy write-backs then took that live
+           pool for a finalized one and dropped what it had left out. Nothing to do now but say so */
+        static volatile LONG told;
+        if (InterlockedIncrement(&told) <= 8)
+            hos_log("nvn: memory pool %#llx+%#llx finalized again (lr %#llx): left alone", (unsigned long long)o->gpu,
+                    (unsigned long long)o->size, (unsigned long long)c->x[30]);
     }
     o->magic = 0;
 }
@@ -1285,7 +1298,8 @@ static void pool_put(void *b, unsigned cls) {
    object (guest memory). The object holds its slot's number; a slot names the object it belongs to, so a slot number
    that is not the object's own is not used: the object gets a new slot, as an object never initialized does. Slots are
    in chunks that are never freed, so a lookup needs no lock (a command buffer records on one thread at a time). */
-typedef struct { uint64_t owner; uint8_t *seg, *cur, *end; } cmd_rec;
+/* (extra: bytes of the recording no accounting counts, the HL_UBO_CHECK records: a CallCommands of it leaves them out) */
+typedef struct { uint64_t owner; uint8_t *seg, *cur, *end; uint64_t extra; } cmd_rec;
 #define CMD_CHUNK_BITS 10
 #define CMD_CHUNKS 4096u                     /* (4M command buffers at once) */
 static cmd_rec *volatile cmd_chunks[CMD_CHUNKS];
@@ -1636,6 +1650,44 @@ NV(nvnCommandBufferBeginRecording) {
     o->hw_used -= 8;   /* BEGIN / END have no hardware equivalent */
     o->hw_start = o->hw_used;
 }
+/* (Hookshot) HL_UBO_CHECK=1 (a measurement, docs/native-engine/direct-emission.md section 9): each BindUniformBuffer's
+   record is followed by a NOP_UBO_CHECK record with a hash of the block's bytes at the bind, completed with their hash
+   at the end of the recording (EndRecording) and at the submit (QueueSubmitCommands); the replay compares them with
+   what it reads as submitted. The record is outside the accounting the game reads (cmd_rec.extra) */
+static int ubo_check_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("HL_UBO_CHECK");
+        on = e && atoi(e) != 0;
+        if (on) hos_log("hl ubo check: uniform blocks hashed at their bind, the recording's end and the submit (HL_UBO_CHECK=1)");
+    }
+    return on;
+}
+/* the block's bytes now (at most NVN_UBO_CHECK_MAX), hashed; 0 and *ok = 0 when they cannot be read */
+static uint64_t ubo_check_hash(uint64_t addr, uint64_t size, int *ok) {
+    static _Thread_local uint8_t *buf;
+    if (!buf) buf = (uint8_t *)malloc(NVN_UBO_CHECK_MAX);
+    const uint64_t n = size < NVN_UBO_CHECK_MAX ? size : NVN_UBO_CHECK_MAX;
+    *ok = buf && n && nvn_gpu_read(addr, buf, n);
+    return *ok ? nvn_ubo_hash(buf, n) : 0;
+}
+/* the check records of [p, end) not given their end-of-recording hash yet (a called recording's have theirs) */
+static void ubo_check_end(uint8_t *p, const uint8_t *end) {
+    while (p < end) {
+        nvn_op_hdr h;
+        memcpy(&h, p, sizeof h);
+        if (h.size < 8) return;
+        if (h.op == NOP_UBO_CHECK) {
+            nvn_p_ubo_check *k = (nvn_p_ubo_check *)(p + 8);
+            if (!(k->flags & NVN_UBO_CHECK_END)) {
+                int ok;
+                k->h_end = ubo_check_hash(k->addr, k->size, &ok);
+                k->flags |= NVN_UBO_CHECK_END | (ok ? 0 : NVN_UBO_CHECK_UNREAD);
+            }
+        }
+        p += h.size;
+    }
+}
 /* the recording, BEGIN to END, is contiguous in the command buffer's segment: one copy of it */
 static uint8_t *flatten(const uint8_t *p, size_t n) {
     unsigned cls;
@@ -1771,6 +1823,80 @@ static void *rec(nvn_cmd *o, uint32_t op, size_t payload) {
 }
 #define REC(o, OP, T) ((T *)rec((o), (OP), sizeof(T)))
 #define RECN(o, OP, T, ARR, N) ((T *)rec((o), (OP), offsetof(T, ARR) + sizeof(((T *)0)->ARR[0]) * (size_t)(N)))
+
+/* (Hookshot) Records written by native producers (engine/native, hl/c/hl_gfx_rec.h; host/hl_gfx_rec.c hands these to
+   it; docs/native-engine/direct-emission.md): the same rec() and hw_fix() as the procedures, on a command buffer opened
+   once per native unit of work by the thread recording it. The layouts native code writes are this file's, checked
+   here field by field. */
+#define REC_SAME(T, H) _Static_assert(sizeof(T) == sizeof(H), #T " is not " #H)
+#define REC_AT(T, H, f) _Static_assert(offsetof(T, f) == offsetof(H, f), #T "." #f " is not " #H "." #f)
+_Static_assert(sizeof(hl_rec_hdr) == sizeof(nvn_op_hdr) && offsetof(hl_rec_hdr, size) == offsetof(nvn_op_hdr, size), "record header");
+_Static_assert(HL_REC_VIEWPORTS == NOP_VIEWPORTS && HL_REC_SCISSOR == NOP_SCISSOR && HL_REC_DEPTH_RANGE == NOP_DEPTH_RANGE &&
+               HL_REC_BIND_STATE == NOP_BIND_STATE && HL_REC_BIND_VATTR == NOP_BIND_VATTR &&
+               HL_REC_BIND_VSTREAM == NOP_BIND_VSTREAM && HL_REC_BIND_VBUF == NOP_BIND_VBUF && HL_REC_BIND_UBO == NOP_BIND_UBO &&
+               HL_REC_BIND_SSBO == NOP_BIND_SSBO && HL_REC_BIND_TEX == NOP_BIND_TEX && HL_REC_BIND_SAMP == NOP_BIND_SAMP &&
+               HL_REC_STENCIL == NOP_STENCIL && HL_REC_POLY_OFFSET == NOP_POLY_OFFSET && HL_REC_DRAW == NOP_DRAW &&
+               HL_REC_DRAW_IDX == NOP_DRAW_IDX && HL_REC_BARRIER == NOP_BARRIER && HL_REC_BLEND_COLOR == NOP_BLEND_COLOR &&
+               HL_REC_BIND_IMG == NOP_BIND_IMG && HL_REC_DEPTH_CLAMP == NOP_DEPTH_CLAMP &&
+               HL_REC_RENDER_ENABLE == NOP_RENDER_ENABLE && HL_REC_RASTER_DISCARD == NOP_RASTER_DISCARD, "record op numbers");
+_Static_assert(HL_NVN_FACE_FRONT == NVN_FACE_FRONT && HL_NVN_FACE_BACK == NVN_FACE_BACK &&
+               HL_NVN_BLEND_FUNC_ZERO == NVN_BLEND_FUNC_ZERO && HL_NVN_BLEND_FUNC_ONE == NVN_BLEND_FUNC_ONE &&
+               HL_NVN_BLEND_EQUATION_ADD == NVN_BLEND_EQUATION_ADD && HL_NVN_LOGIC_OP_COPY == NVN_LOGIC_OP_COPY &&
+               HL_NVN_ALPHA_FUNC_ALWAYS == NVN_ALPHA_FUNC_ALWAYS, "NVN values of the state objects' defaults");
+/* (the state objects are bit fields declared alike: their sizes here, their bits by records_test.cpp's independent
+   reading and HL_GFX_REC_CHECK in the game) */
+REC_SAME(hl_rec_color_st, nvn_color_st); REC_SAME(hl_rec_chmask_st, nvn_chmask_st); REC_SAME(hl_rec_blend_st, nvn_blend_st);
+REC_SAME(hl_rec_ms_st, nvn_ms_st); REC_SAME(hl_rec_poly_st, nvn_poly_st); REC_SAME(hl_rec_ds_st, nvn_ds_st);
+REC_SAME(hl_rec_range, NVNbufferRange); REC_AT(hl_rec_range, NVNbufferRange, size);
+REC_SAME(hl_rec_viewports, nvn_p_viewports); REC_AT(hl_rec_viewports, nvn_p_viewports, n); REC_AT(hl_rec_viewports, nvn_p_viewports, v);
+REC_SAME(hl_rec_scissor, nvn_p_scissor); REC_AT(hl_rec_scissor, nvn_p_scissor, y); REC_AT(hl_rec_scissor, nvn_p_scissor, w); REC_AT(hl_rec_scissor, nvn_p_scissor, h);
+REC_SAME(hl_rec_flag, nvn_p_flag); REC_AT(hl_rec_flag, nvn_p_flag, index);
+REC_SAME(hl_rec_depth_range, nvn_p_depth_range); REC_AT(hl_rec_depth_range, nvn_p_depth_range, f);
+REC_SAME(hl_rec_bind_state, nvn_p_bind_state); REC_AT(hl_rec_bind_state, nvn_p_bind_state, bytes);
+REC_SAME(hl_rec_bind_vattr, nvn_p_bind_vattr); REC_AT(hl_rec_bind_vattr, nvn_p_bind_vattr, n); REC_AT(hl_rec_bind_vattr, nvn_p_bind_vattr, st);
+REC_SAME(hl_rec_vstream_st, nvn_vs_st); REC_AT(hl_rec_vstream_st, nvn_vs_st, divisor);
+REC_SAME(hl_rec_bind_vstream, nvn_p_bind_vstream); REC_AT(hl_rec_bind_vstream, nvn_p_bind_vstream, n); REC_AT(hl_rec_bind_vstream, nvn_p_bind_vstream, st);
+REC_SAME(hl_rec_bind_vbuf, nvn_p_bind_vbuf); REC_AT(hl_rec_bind_vbuf, nvn_p_bind_vbuf, n); REC_AT(hl_rec_bind_vbuf, nvn_p_bind_vbuf, r);
+REC_SAME(hl_rec_bind_buf, nvn_p_bind_buf); REC_AT(hl_rec_bind_buf, nvn_p_bind_buf, index); REC_AT(hl_rec_bind_buf, nvn_p_bind_buf, addr); REC_AT(hl_rec_bind_buf, nvn_p_bind_buf, size);
+REC_SAME(hl_rec_bind_handles, nvn_p_bind_handles); REC_AT(hl_rec_bind_handles, nvn_p_bind_handles, first); REC_AT(hl_rec_bind_handles, nvn_p_bind_handles, n);
+REC_AT(hl_rec_bind_handles, nvn_p_bind_handles, src); REC_AT(hl_rec_bind_handles, nvn_p_bind_handles, h);
+REC_SAME(hl_rec_stencil, nvn_p_stencil); REC_AT(hl_rec_stencil, nvn_p_stencil, value_mask); REC_AT(hl_rec_stencil, nvn_p_stencil, mask);
+REC_AT(hl_rec_stencil, nvn_p_stencil, ref); REC_AT(hl_rec_stencil, nvn_p_stencil, which);
+REC_SAME(hl_rec_poly_offset, nvn_p_poly_offset); REC_AT(hl_rec_poly_offset, nvn_p_poly_offset, units); REC_AT(hl_rec_poly_offset, nvn_p_poly_offset, clamp);
+REC_SAME(hl_rec_draw, nvn_p_draw); REC_AT(hl_rec_draw, nvn_p_draw, first); REC_AT(hl_rec_draw, nvn_p_draw, count);
+REC_AT(hl_rec_draw, nvn_p_draw, base_instance); REC_AT(hl_rec_draw, nvn_p_draw, instances);
+REC_SAME(hl_rec_draw_idx, nvn_p_draw_idx); REC_AT(hl_rec_draw_idx, nvn_p_draw_idx, itype); REC_AT(hl_rec_draw_idx, nvn_p_draw_idx, count);
+REC_AT(hl_rec_draw_idx, nvn_p_draw_idx, base_vertex); REC_AT(hl_rec_draw_idx, nvn_p_draw_idx, base_instance);
+REC_AT(hl_rec_draw_idx, nvn_p_draw_idx, instances); REC_AT(hl_rec_draw_idx, nvn_p_draw_idx, ibuf);
+REC_SAME(hl_rec_blend_color, nvn_p_blend_color);
+_Static_assert(sizeof(hl_rec_barrier) == 8, "Barrier's record: an 8-byte payload, the bits first");
+/* the command buffer at guest address cmd when it holds its own slot (else NULL: the procedures adopt a slot, as always) */
+void *nvn_rec_open(uint64_t cmd) {
+    if (!cmd) return NULL;
+    nvn_cmd *o = CB(gw(cmd, sizeof(nvn_cmd)));
+    const cmd_rec *r = cmd_slot(o->slot);
+    return r && r->owner == cmd ? o : NULL;
+}
+void *nvn_rec_append(void *cmd, uint32_t op, uint32_t payload, uint32_t hw) {
+    nvn_cmd *o = CB(cmd);
+    void *p = rec(o, op, payload);
+    if (hw) hw_fix(o, hw);
+    return p;
+}
+void nvn_rec_mark(void *cmd, hl_rec_mark *m) {
+    const nvn_cmd *o = CB(cmd);
+    const cmd_rec *r = cmd_slot(o->slot);
+    m->offset = r->seg ? (uint64_t)(r->cur - r->seg) : 0;
+    m->cmd_used = o->cmd_used, m->hw_used = o->hw_used, m->last_rec = o->last_rec;
+}
+const uint8_t *nvn_rec_bytes(void *cmd, uint64_t offset) { return cmd_slot(CB(cmd)->slot)->seg + offset; }
+void nvn_rec_rewind(void *cmd, const hl_rec_mark *m) {
+    nvn_cmd *o = CB(cmd);
+    cmd_rec *r = cmd_slot(o->slot);
+    if (r->seg) r->cur = r->seg + m->offset;
+    o->cmd_used = m->cmd_used, o->hw_used = m->hw_used, o->last_rec = m->last_rec;
+}
+const void *nvn_rec_guest(uint64_t a, uint64_t n) { return gw(a, n); }
 
 NV(nvnCommandBufferSignalEvent) {
     {   /* (the GPU's signals as recorded, 40 then every 5000) */
@@ -2042,6 +2168,48 @@ static void bind_vbufs(nvn_cmd *o, int first, int n, const NVNbufferRange *rg) {
 }
 NV(nvnCommandBufferBindVertexBuffers) { bind_vbufs(CB(P(0)), I(1), I(2), (const NVNbufferRange *)P(3)); }
 NV(nvnCommandBufferBindVertexBuffer) { NVNbufferRange r = {U64(2), U64(3)}; bind_vbufs(CB(P(0)), I(1), 1, &r); }
+/* (Hookshot) HL_UBO_INLINE=1 (direct-emission.md section 10): a uniform bind of the slots HL_UBO_CHECK found final at their
+   bind in every scene (main PC, kokiri / castle / hyrule: every bind of them equal to what the replay read as submitted, 0
+   different, 0 updated in the stream) is recorded with the block's bytes (NOP_UBO_INLINE), which the replay's descriptor
+   serves; the address stays in the bind for the replay's other readers. The other slots carry per-draw blocks the game
+   writes after the recording ends (step 1: 99.3% of the different binds), which only the submit sees. Bit k of a stage's
+   mask: slot k */
+static const uint16_t ubo_inline_slots[8] = {
+    1u << 5 | 1u << 6 | 1u << 7 | 1u << 8 | 1u << 10 | 1u << 11 | 1u << 13,                        /* stage 0 */
+    1u << 4 | 1u << 5 | 1u << 6 | 1u << 7 | 1u << 8 | 1u << 10 | 1u << 11 | 1u << 12 | 1u << 13,   /* stage 1 */
+    (uint16_t)(0x3fffu & ~(1u << 9)),                                                            /* stage 2: 0-13 but 9 */
+    0, 0,
+    1u << 1 | 1u << 2,                                                                           /* stage 5 (compute) */
+    0, 0};
+static int ubo_inline_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char *e = getenv("HL_UBO_INLINE");
+        on = e && atoi(e) != 0;
+        if (on) hos_log("hl ubo inline: the uniform binds of the slots measured final at their bind carry their bytes (HL_UBO_INLINE=1)");
+    }
+    return on;
+}
+static volatile LONG64 ubo_inlined, ubo_inline_bytes;
+/* the bind as an inline record when it qualifies (1), with the accounting of the address record it stands for: cmd_used
+   and hw_used as BindUniformBuffer's 40-byte record hw_fix'd to 20, the rest of its size uncounted (cmd_rec.extra) */
+static int ubo_inline(nvn_cmd *o, int stage, int index, uint64_t addr, uint64_t size) {
+    if (stage < 0 || stage >= 8 || index < 0 || index >= 16 || !(ubo_inline_slots[stage] >> index & 1)) return 0;
+    if (!size || size > NVN_UBO_CHECK_MAX || !nvn_gpu_contiguous(addr, size)) return 0;
+    const uint8_t *src = nvn_gpu_host(addr);
+    if (!src) return 0;
+    const uint64_t cu = o->cmd_used, hu = o->hw_used;
+    const uint32_t payload = (uint32_t)(sizeof(nvn_p_ubo_inline) + size);
+    nvn_p_ubo_inline *r = (nvn_p_ubo_inline *)rec(o, NOP_UBO_INLINE, payload);
+    r->stage = stage, r->index = index, r->addr = addr, r->size = size, r->n = (uint32_t)size;
+    memcpy(r + 1, src, (size_t)size);
+    const uint64_t whole = (8 + payload + 7) & ~(uint64_t)7, plain = (8 + sizeof(nvn_p_bind_buf) + 7) & ~(uint64_t)7;
+    o->cmd_used = cu + plain, o->hw_used = hu + 20, o->last_rec = 20;
+    cmd_host(o)->extra += whole - plain;
+    const LONG64 k = InterlockedIncrement64(&ubo_inlined), b = InterlockedAdd64(&ubo_inline_bytes, (LONG64)size);
+    if (k % 200000 == 1) hos_log("hl ubo inline: %lld binds inlined (%.1f MB)", (long long)k, b / 1048576.0);
+    return 1;
+}
 static void bind_buf(nvn_cmd *o, uint32_t op, int stage, int index, uint64_t addr, uint64_t size) {
     nvn_p_bind_buf *r = REC(o, op, nvn_p_bind_buf);
     r->stage = stage, r->index = index, r->addr = addr, r->size = size;
@@ -2429,6 +2597,12 @@ static void resolve_deferred(uint8_t *p) {
         if (h.op == NOP_BIND_BUFS) {
             nvn_p_bind_bufs *b = (nvn_p_bind_bufs *)(p + 8);
             if (b->src && b->n > 0 && b->n <= 16) memcpy(b->r, gw(b->src, sizeof(NVNbufferRange) * (size_t)b->n), sizeof(NVNbufferRange) * (size_t)b->n);
+        }
+        if (h.op == NOP_UBO_CHECK) {   /* (HL_UBO_CHECK: the block as the submit sees it) */
+            nvn_p_ubo_check *k = (nvn_p_ubo_check *)(p + 8);
+            int ok;
+            k->h_sub = ubo_check_hash(k->addr, k->size, &ok);
+            k->flags |= NVN_UBO_CHECK_SUB | (ok ? 0 : NVN_UBO_CHECK_UNREAD);
         }
         p += h.size;
     }
@@ -3229,6 +3403,7 @@ static void unimplemented(Ctx *c, void *name) {
     ReleaseSRWLockExclusive(&lock);
     RET(strstr((const char *)name, "Initialize") ? 1 : 0);
 }
+void hl_gfx_nvn_proc(const char *name, void (**fn)(Ctx *, void *), void **user);   /* host/hl_gfx.c */
 static int cmp_impl(const void *a, const void *b) { return strcmp(((const nvn_impl *)a)->name, ((const nvn_impl *)b)->name); }
 uint64_t nvn_native_proc(const char *name) {
     static nvn_impl *sorted;
@@ -3248,7 +3423,12 @@ uint64_t nvn_native_proc(const char *name) {
     uint64_t a;
     if (f) {
         const size_t i = (size_t)(f - sorted);
-        if (!addr[i]) addr[i] = hos_hostcall(f->name, f->fn, NULL);
+        if (!addr[i]) {
+            void (*fn)(Ctx *, void *) = f->fn;
+            void *user = NULL;
+            hl_gfx_nvn_proc(f->name, &fn, &user);   /* (HL_GFX_CHECK's tap, host/hl_gfx.c; else left as it is) */
+            addr[i] = hos_hostcall(f->name, fn, user);
+        }
         a = addr[i];
     } else {   /* asked for, maybe never called: it stops the game only when called */
         static struct { char *name; uint64_t a; } *un;

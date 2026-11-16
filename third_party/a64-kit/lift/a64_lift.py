@@ -557,6 +557,7 @@ def pack_flags(text):
     return FLAGS4.sub(sub, text)
 
 
+# (hookshot) its static inline helpers are always_inline, as VFPX_HEADER's (HOOKSHOT_LIGHT_PASSES)
 VSET_HEADER = r"""
 /* the four flags in one store (pack_flags in a64_lift.py): n, z, c, v are adjacent bytes of the context */
 static inline __attribute__((always_inline)) void a64_set_nzcv(Ctx *c, uint32_t n, uint32_t z, uint32_t cf, uint32_t v) {
@@ -592,9 +593,9 @@ static inline __attribute__((always_inline)) void a64_vst_lo64(uint64_t *d, __m1
     _mm_storeu_si128((__m128i *)d, r);
 }
 #else
-static inline void a64_vst16(uint64_t *d, const void *s) { memcpy(d, s, 16); }
-static inline void a64_vset64(uint64_t *d, uint64_t v) { d[0] = v; d[1] = 0; }
-static inline void a64_vset128(uint64_t *d, uint64_t lo, uint64_t hi) { d[0] = lo; d[1] = hi; }
+static inline __attribute__((always_inline)) void a64_vst16(uint64_t *d, const void *s) { memcpy(d, s, 16); }
+static inline __attribute__((always_inline)) void a64_vset64(uint64_t *d, uint64_t v) { d[0] = v; d[1] = 0; }
+static inline __attribute__((always_inline)) void a64_vset128(uint64_t *d, uint64_t lo, uint64_t hi) { d[0] = lo; d[1] = hi; }
 #endif
 static inline __attribute__((always_inline)) void a64_vset_lo(uint64_t *d, const void *s, int n) {
     uint64_t v = 0;
@@ -728,17 +729,51 @@ def ff_min():
 
 def ff_eligible(text):
     """an instruction's C text may sit inside a fast float region: no store, control flow or system state; only pure calls"""
-    if any(b in FF_FP_OK.sub("", text) for b in FF_BAD):
+    rest = FF_FP_OK.sub("", text)   # (hookshot: once, not once for each of FF_BAD's words)
+    if any(b in rest for b in FF_BAD):
         return False
     return all(n in FF_PURE or n.startswith(("a64_fpx_", "a64_vfpx_")) for n in FF_CALL.findall(text))
 
 
-def ff_region(items):
+# (hookshot) the emit asks these of every instruction of every function, ~13 million times in a lift of OoT, of far fewer
+# distinct instruction texts: each answer is kept by its text (the same C, byte for byte; the lift a third quicker on Windows)
+_ff_joins = {}
+_ff_convs = {}
+_fp_frames = {}
+
+
+def ff_joins(text, dead):
+    """ff_eligible of an instruction's text with the flag stores dead there dropped (dead: the mask, None for none), by both"""
+    j = _ff_joins.get((text, dead))
+    if j is None:
+        j = _ff_joins[(text, dead)] = ff_eligible(drop_flag_stores(text, dead) if dead is not None else text)
+    return j
+
+
+def ff_convs(text):
+    """the float ops ff_region can make fast in one instruction's text (FF_CONV's matches)"""
+    n = _ff_convs.get(text)
+    if n is None:
+        n = _ff_convs[text] = len(FF_CONV.findall(text))
+    return n
+
+
+def fp_is_frame_kept(text):
+    """fp_is_frame, kept by the text (two regex searches each, asked of every instruction)"""
+    f = _fp_frames.get(text)
+    if f is None:
+        f = _fp_frames[text] = fp_is_frame(text)
+    return f
+
+
+def ff_region(items, least=None):
     """a run's C text ([(pc, text)], every text ff_eligible): the fast and exact copies, or the exact text alone when the
-    run has too few float ops to pay for its check. (text, number of ops made fast)"""
+    run has too few float ops to pay for its check. (text, number of ops made fast). least: ff_min(), read once by the
+    caller (hookshot: once a function, not for each of the 3.8 million runs of OoT)"""
     exact = "\n".join(t for _, t in items)
-    n = len(FF_CONV.findall(exact))
-    if n < ff_min():
+    # (FF_CONV's matches are in one instruction's text each, so the run's count is their sum)
+    n = sum(ff_convs(t) for _, t in items)
+    if n < (ff_min() if least is None else least):
         return exact, 0
     fast = FF_CONV.sub(lambda m: "a64_ff_v%s(" % m.group(1) if m.group(1) else "a64_ff_%s(" % m.group(2), exact)
     xs = sorted({int(r) for r in REG_REF.findall(exact)})
@@ -773,7 +808,7 @@ FASTFP_HEADER = r"""
 #if RECOMP_FPX_HOST == 2 && defined(__x86_64__) && !defined(__EMSCRIPTEN__)
 #include <stdlib.h>
 #include <stdio.h>
-static int a64_ff_enabled_(void) { static int v = -1; if (v < 0) v = !getenv("HOS_NO_FASTFP"); return v; }
+static inline __attribute__((always_inline)) int a64_ff_enabled_(void) { static int v = -1; if (v < 0) v = !getenv("HOS_NO_FASTFP"); return v; }
 #define A64_FF_ON(c) (RECOMP_FPX_OPEN(c) && a64_ff_enabled_())
 /* MXCSR: exceptions masked, round to nearest, DAZ off, FTZ as FPCR.FZ, flags cleared; the old value returned */
 static inline __attribute__((always_inline)) unsigned a64_ff_begin(const Ctx *c) {
@@ -881,7 +916,7 @@ static volatile long long a64_ff_n_[3];   /* runs, clean, mismatched when clean 
 static __attribute__((noinline, cold)) void a64_ff_check_print_(unsigned pc, long long bad) {
     if (bad < 16) fprintf(stderr, "fastfp check: MISMATCH in the run at %#x (%s)\n", pc, __BASE_FILE__);
 }
-static inline void a64_ff_check(unsigned pc, int clean, int same) {
+static inline __attribute__((always_inline)) void a64_ff_check(unsigned pc, int clean, int same) {
     const long long n = __atomic_add_fetch(&a64_ff_n_[0], 1, __ATOMIC_RELAXED);
     if (clean) __atomic_add_fetch(&a64_ff_n_[1], 1, __ATOMIC_RELAXED);
     if (clean && !same) a64_ff_check_print_(pc, __atomic_fetch_add(&a64_ff_n_[2], 1, __ATOMIC_RELAXED));
@@ -934,20 +969,22 @@ static inline __attribute__((always_inline)) uint32_t a64_fcmp64k(Ctx *c, const 
 }
 """
 
+# (hookshot) every static inline helper of the header is always_inline: lifted chunks compile without the module inliner
+# (nx2/build.py HOOKSHOT_LIGHT_PASSES), which left the plain ones out of line, as real calls
 VFPX_HEADER = r"""
 /* ---- 2/4-lane single-precision ops on SSE (vectorize_fpx in a64_lift.py): a lane kept only where the scalar fast
    path would keep it (the same tests, on every lane); otherwise each lane goes through its scalar helper ---- */
 #if RECOMP_FPX_HOST == 2
-static inline __m128i a64_v_ult(__m128i x, uint32_t k) {   /* unsigned x < k, per lane */
+static inline __attribute__((always_inline)) __m128i a64_v_ult(__m128i x, uint32_t k) {   /* unsigned x < k, per lane */
     return _mm_cmplt_epi32(_mm_xor_si128(x, _mm_set1_epi32((int)0x80000000u)), _mm_set1_epi32((int)(k ^ 0x80000000u)));
 }
-static inline __m128i a64_v_abs(__m128i x) { return _mm_and_si128(x, _mm_set1_epi32(0x7fffffff)); }
-static inline __m128i a64_v_big(__m128i t) { return a64_v_ult(_mm_sub_epi32(a64_v_abs(t), _mm_set1_epi32(0x00800001)), 0x7effffffu); }
-static inline __m128i a64_v_zero(__m128i x) { return _mm_cmpeq_epi32(a64_v_abs(x), _mm_setzero_si128()); }
-static inline __m128i a64_v_nonfin(__m128i t) { const __m128i e = _mm_set1_epi32(0x7f800000); return _mm_cmpeq_epi32(_mm_and_si128(t, e), e); }
-static inline __m128i a64_v_subn(__m128i x) { return a64_v_ult(_mm_sub_epi32(_mm_slli_epi32(x, 1), _mm_set1_epi32(1)), 0x00ffffffu); }
+static inline __attribute__((always_inline)) __m128i a64_v_abs(__m128i x) { return _mm_and_si128(x, _mm_set1_epi32(0x7fffffff)); }
+static inline __attribute__((always_inline)) __m128i a64_v_big(__m128i t) { return a64_v_ult(_mm_sub_epi32(a64_v_abs(t), _mm_set1_epi32(0x00800001)), 0x7effffffu); }
+static inline __attribute__((always_inline)) __m128i a64_v_zero(__m128i x) { return _mm_cmpeq_epi32(a64_v_abs(x), _mm_setzero_si128()); }
+static inline __attribute__((always_inline)) __m128i a64_v_nonfin(__m128i t) { const __m128i e = _mm_set1_epi32(0x7f800000); return _mm_cmpeq_epi32(_mm_and_si128(t, e), e); }
+static inline __attribute__((always_inline)) __m128i a64_v_subn(__m128i x) { return a64_v_ult(_mm_sub_epi32(_mm_slli_epi32(x, 1), _mm_set1_epi32(1)), 0x00ffffffu); }
 /* lanes that overflowed (an infinite result of finite operands), kept once FPSR.OFC is raised (FPX_FZ_HEADER) */
-static inline __m128i a64_v_ovf(const Ctx *c, __m128i a, __m128i b, __m128i t) {
+static inline __attribute__((always_inline)) __m128i a64_v_ovf(const Ctx *c, __m128i a, __m128i b, __m128i t) {
     if (!(c->fpsr & 4u)) return _mm_setzero_si128();
     const __m128i inf = _mm_cmpeq_epi32(a64_v_abs(t), _mm_set1_epi32(0x7f800000));
     return _mm_andnot_si128(_mm_or_si128(a64_v_nonfin(a), a64_v_nonfin(b)), inf);
@@ -968,7 +1005,7 @@ static inline __attribute__((always_inline)) __m128i a64_v_qnan(const Ctx *c, __
     *r = _mm_or_si128(_mm_andnot_si128(ok, *r), _mm_and_si128(ok, v));
     return ok;
 }
-static inline __m128i a64_v_put(__m128i r, uint32_t v, int j) {   /* lane j of r = v */
+static inline __attribute__((always_inline)) __m128i a64_v_put(__m128i r, uint32_t v, int j) {   /* lane j of r = v */
     const __m128i at = _mm_cmpeq_epi32(_mm_set1_epi32(j), _mm_setr_epi32(0, 1, 2, 3));
     return _mm_or_si128(_mm_andnot_si128(at, r), _mm_and_si128(at, _mm_set1_epi32((int)v)));
 }
@@ -1080,6 +1117,7 @@ static inline __attribute__((always_inline)) void a64_vfpx_mul32(Ctx *c, uint64_
 # exact body for it); under FZ with UFC raised a result below the normal range is the native one flushed to a zero of its
 # sign. Sums are exact there (a tiny sum of normal numbers is a subnormal exactly). No subnormal operand (those flush
 # first). FMUL/FNMUL/FMLA-family S: a64_fpx_sticky32 below.
+# (hookshot) its static inline helpers are always_inline, as VFPX_HEADER's (HOOKSHOT_LIGHT_PASSES)
 FPX_FZ_HEADER = r"""
 static inline __attribute__((always_inline)) int a64_fpx_fz_result(const Ctx *c, uint64_t a, uint64_t b, uint64_t t, uint64_t *v) {
     const uint32_t m = (uint32_t)t & 0x7fffffffu;
@@ -1095,8 +1133,8 @@ static inline __attribute__((always_inline)) int a64_fpx_fz_add32(const Ctx *c, 
 static inline __attribute__((always_inline)) int a64_fpx_fz_sub32(const Ctx *c, uint64_t a, uint64_t b, uint64_t *v) {
     return a64_fpx_fz_result(c, a, b, recomp_fpx_fb(recomp_fpx_f(a) - recomp_fpx_f(b)), v); }
 #else
-static inline int a64_fpx_fz_add32(const Ctx *c, uint64_t a, uint64_t b, uint64_t *v) { (void)c; (void)a; (void)b; (void)v; return 0; }
-static inline int a64_fpx_fz_sub32(const Ctx *c, uint64_t a, uint64_t b, uint64_t *v) { (void)c; (void)a; (void)b; (void)v; return 0; }
+static inline __attribute__((always_inline)) int a64_fpx_fz_add32(const Ctx *c, uint64_t a, uint64_t b, uint64_t *v) { (void)c; (void)a; (void)b; (void)v; return 0; }
+static inline __attribute__((always_inline)) int a64_fpx_fz_sub32(const Ctx *c, uint64_t a, uint64_t b, uint64_t *v) { (void)c; (void)a; (void)b; (void)v; return 0; }
 #endif
 /* FMUL/FNMUL/FMLA-family S past the fast path (the "sticky" rescue of the outlined wrappers a64_fpx_mul32_fma32 and
    a64_fpx_fma32_fma32, inside their RECOMP_FPX_OPEN gate): one hardware multiply or fused multiply-add, kept when every
@@ -1239,8 +1277,8 @@ static inline __attribute__((always_inline)) int a64_fpx_easy_mul32(Ctx *c, uint
     return 1;
 }
 #else
-static inline int a64_fpx_easy_sum32(Ctx *c, uint64_t a0, uint64_t b0, int sub, uint64_t *v) { (void)c; (void)a0; (void)b0; (void)sub; (void)v; return 0; }
-static inline int a64_fpx_easy_mul32(Ctx *c, uint64_t a0, uint64_t b0, uint64_t *v) { (void)c; (void)a0; (void)b0; (void)v; return 0; }
+static inline __attribute__((always_inline)) int a64_fpx_easy_sum32(Ctx *c, uint64_t a0, uint64_t b0, int sub, uint64_t *v) { (void)c; (void)a0; (void)b0; (void)sub; (void)v; return 0; }
+static inline __attribute__((always_inline)) int a64_fpx_easy_mul32(Ctx *c, uint64_t a0, uint64_t b0, uint64_t *v) { (void)c; (void)a0; (void)b0; (void)v; return 0; }
 #endif"""
 
 
@@ -1998,11 +2036,12 @@ class Lifter:
         # (fast float regions, ff_region: the run of joinable instructions so far, [(pc, text)])
         ff_only = getattr(self, "ff_only", None)
         ff = bool(fastfp_mode()) and (ff_only is None or self.fname(e) in ff_only)
+        least = ff_min()   # (hookshot: read once a function, not for each run)
         run = []
 
         def flush():
             if run:
-                text, n = ff_region(run)
+                text, n = ff_region(run, least)
                 out.append(text)
                 if n:
                     self.stats["ff_regions"] = self.stats.get("ff_regions", 0) + 1
@@ -2016,7 +2055,7 @@ class Lifter:
             if ff and kind == "op" and pc not in self.after and not (pc in labels or (pc == e and e in labels)):
                 t, f = texts[(w, pc) if pc_relative(w) else w]
                 if not f & (a64emit.UNHANDLED | a64emit.TERMINATOR):
-                    joins = ff_eligible(drop_flag_stores(t, dead[pc]) if pc in dead else t)
+                    joins = ff_joins(t, dead[pc] if pc in dead else None)
             if not joins:
                 flush()
             if pc in labels or (pc == e and e in labels):
@@ -2035,7 +2074,7 @@ class Lifter:
                 elif flags & a64emit.TERMINATOR:
                     raise SystemExit("a64emit closed a block at %#x (%08x): classify() must handle it" % (pc, w))
                 else:
-                    if frame and not fp_is_frame(text):
+                    if frame and not fp_is_frame_kept(text):
                         frame = False
                     if pc in dead:
                         text = drop_flag_stores(text, dead[pc])

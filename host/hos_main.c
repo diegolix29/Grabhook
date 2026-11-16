@@ -19,6 +19,8 @@
 #include "hos_wide_size.h"   /* (the widescreen picture's size, shared with the Insert menu) */
 #include "../gpu/vk/vk_api.h"
 #include "../gpu/vk/oot_cheat_items.h"
+#include "../gpu/vk/oot_teleport_capture.h"
+#include "../gpu/vk/oot_tp_places_data.h"
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -157,6 +159,8 @@ static int reserve_guest(void) {
     /* mkw-recomp: 512 GB reserved, committed as the runtime hands memory out (hos_commit) or on first touch */
     void hos_commit_init(void);
     hos_commit_init();
+    int hos_reserve_guest_pages(int write_watch);   /* (mkw_glue.c: HOS_GUEST_PAGES=1, the heap and regions over a placeholder) */
+    if (hos_reserve_guest_pages(0)) return 1;   /* (the window is not hardware write-watched: the soft write watch) */
     return VirtualAlloc((void *)A64_HOST_BASE, GUEST_SPACE, MEM_RESERVE, PAGE_NOACCESS) == (void *)A64_HOST_BASE;
 #else
     /* (linux) the whole window readable and writable at once, its pages made as they are first touched (no commit
@@ -595,6 +599,46 @@ static void removed_switch_notes(void) {
             else hos_log("env: %s is no longer read: it does nothing", gone[i][0]);
         }
 }
+
+#ifdef __linux__
+#include "hos_submit_thread.h"
+/* (Linux) Mesa's submit thread (hos_submit_thread.h): decided in main() after load_hookshot_env (the switch may come from
+   hookshot_env.txt) and before the first thread (SDL's, the log's, the game's): the setenv is not safe once another thread can
+   getenv. The variable stays set for the process. The note goes to the log after its first line (game_main), and to the Vulkan
+   back end, which says whether the device it picked is RADV (hos_posix_submit_thread_note, vk_main.cpp create_device) */
+static char submit_thread_note[192];
+const char *hos_posix_submit_thread_note(void) { return submit_thread_note; }
+
+static void submit_thread_at_start(void) {
+    const char *mesa = getenv("MESA_VK_ENABLE_SUBMIT_THREAD");
+    const char *user = hos_submit_thread_user_value(mesa, getenv(HOS_SUBMIT_THREAD_MARK));
+    if (mesa && !user) unsetenv("MESA_VK_ENABLE_SUBMIT_THREAD");   /* (inherited from a Hookshot: decided again here) */
+    unsetenv(HOS_SUBMIT_THREAD_MARK);
+    const long online = sysconf(_SC_NPROCESSORS_ONLN);
+    const unsigned threads = online > 0 ? (unsigned)online : 1u;
+    const HosSubmitThread c =
+        hos_submit_thread_decide(hos_drm_has_amdgpu("/sys/class/drm"), user, getenv("RX_VK_RADV_SUBMIT_THREAD"), threads);
+    char *n = submit_thread_note;
+    const size_t cap = sizeof submit_thread_note;
+    switch (c) {
+    case HOS_SUBMIT_THREAD_ON:
+    case HOS_SUBMIT_THREAD_FORCED:
+        setenv("MESA_VK_ENABLE_SUBMIT_THREAD", "1", 1);
+        setenv(HOS_SUBMIT_THREAD_MARK, "1", 1);
+        /* (the device is not picked yet: beside an AMD card another Mesa GPU's queues (ANV) get it too) */
+        if (c == HOS_SUBMIT_THREAD_ON)
+            snprintf(n, cap, "on: %u threads (RX_VK_RADV_SUBMIT_THREAD=0: off); it reaches any other Mesa GPU's queues too", threads);
+        else snprintf(n, cap, "on: RX_VK_RADV_SUBMIT_THREAD=1 (%u threads); it reaches any other Mesa GPU's queues too", threads);
+        break;
+    case HOS_SUBMIT_THREAD_FEW_THREADS:
+        snprintf(n, cap, "off: %u threads, below %u (RX_VK_RADV_SUBMIT_THREAD=1: on)", threads, HOS_SUBMIT_THREAD_MIN_THREADS);
+        break;
+    case HOS_SUBMIT_THREAD_SWITCH_OFF: snprintf(n, cap, "off: RX_VK_RADV_SUBMIT_THREAD=0 (Mesa's own choice)"); break;
+    case HOS_SUBMIT_THREAD_USER_SET: snprintf(n, cap, "left as the user set it: MESA_VK_ENABLE_SUBMIT_THREAD=%.60s", user); break;
+    case HOS_SUBMIT_THREAD_NO_AMDGPU: n[0] = 0; break;   /* (no AMD card: nothing to say) */
+    }
+}
+#endif
 
 int hos_oot_protect_hearts;
 /* Trace the request before the save manager queues it. */
@@ -1040,6 +1084,8 @@ static struct {
     uint64_t result;          /* (and the event manager's answer to the request: 0 seen when the map did not change) */
 } teleport;
 
+static struct { const char *banc, *start, *boot; int carrier; } place_target;   /* (set: oot_teleport goes there instead;
+   carrier: by the empty DefaultParentEvent and the reserved next map, for a point no entrance leads to) */
 static int oot_teleport(Ctx *c, uint64_t actor, unsigned index) {
     teleport.why = "no such destination", teleport.banc = NULL;
     if (index >= sizeof oot_destinations / sizeof oot_destinations[0]) return 0;
@@ -1073,6 +1119,7 @@ static int oot_teleport(Ctx *c, uint64_t actor, unsigned index) {
     const char *banc = child ? d->child_banc : d->adult_banc;
     const char *start = child ? d->child_start : d->adult_start;
     const char *boot = child ? d->child_boot : d->adult_boot;
+    if (place_target.banc) banc = place_target.banc, start = place_target.start, boot = place_target.boot;
     if (!banc) {
         hos_log("cheats: teleport %u has no %s map", index, child ? "child" : "adult");
         teleport.why = child ? "this destination has no map for the child" : "this destination has no map for the adult";
@@ -1089,9 +1136,18 @@ static int oot_teleport(Ctx *c, uint64_t actor, unsigned index) {
     memcpy(A64_PTR(strings + 256), boot, strlen(boot) + 1);
 
     const char *event_env = getenv("HOS_OOT_TELEPORT_EVENT");
-    const char *event = event_env && *event_env ? event_env : "Dm_SY_BancChangeGo";
+    const int carrier = place_target.banc && place_target.carrier;
+    const char *event = carrier ? "DefaultParentEvent" : event_env && *event_env ? event_env : "Dm_SY_BancChangeGo";
     const char *starter_env = getenv("HOS_OOT_TELEPORT_STARTER");
-    const int with_starter = !(starter_env && !strcmp(starter_env, "0"));
+    const int with_starter = !carrier && !(starter_env && !strcmp(starter_env, "0"));
+    if (carrier) {   /* (the reserved strings are written once the request is taken: room for them in the game data's queue) */
+        const uint64_t mgr = oot_singleton(c, OOT_GAMEDATA_SLOT);
+        const int32_t cap = mgr ? (int32_t)recomp_load32(c, mgr + 1584) : 0;
+        if (!mgr || cap <= 0 || (int32_t)(recomp_load32(c, mgr + 1600) & 0xFFFFF) + 2 > cap) {
+            hos_log("cheats: teleport waits: the game data's text queue is full");
+            return 0;
+        }
+    }
 
     const Ctx saved = *c;
     const uint64_t arg = (c->x[31] - OOT_EVENT_ARG_SIZE - 0x100) & ~0xfULL;
@@ -1105,10 +1161,10 @@ static int oot_teleport(Ctx *c, uint64_t actor, unsigned index) {
         if (!buf || strlen(event) + 1 > cap) ok = 0;
         else memcpy(A64_PTR(buf), event, strlen(event) + 1);
     }
-    ok = ok && oot_event_arg(c, arg, "NextBanc", 1, strings);
-    ok = ok && oot_event_arg(c, arg, "NextStartPos", 1, strings + 128);
-    ok = ok && oot_event_arg(c, arg, "BootEventName", 1, strings + 256);
-    ok = ok && oot_event_arg(c, arg, "IsCheckAir", 4, 0);
+    ok = ok && (carrier || oot_event_arg(c, arg, "NextBanc", 1, strings));
+    ok = ok && (carrier || oot_event_arg(c, arg, "NextStartPos", 1, strings + 128));
+    ok = ok && (carrier || oot_event_arg(c, arg, "BootEventName", 1, strings + 256));
+    ok = ok && (carrier || oot_event_arg(c, arg, "IsCheckAir", 4, 0));
     if (ok && with_starter) {   /* the starter actor (arg+0x1950), as OneShotEventMemberRequestEventByEventName sets it */
         c->x[31] = arg;
         c->x[0] = arg + 0x1950, c->x[1] = actor, c->x[2] = 0;
@@ -1146,6 +1202,23 @@ static int oot_teleport(Ctx *c, uint64_t actor, unsigned index) {
         } else {   /* (another game build: say so, a report's log then shows why the minimap stayed away) */
             hos_log("cheats: teleport: the area left had hidden the minimap (MapIconDeactivateByAreaActor): %s not found, left hidden",
                     set_bool ? "the game data manager" : "the game's Bool setter");
+        }
+    }
+    if (carrier && ok && (result & 1)) {   /* (Sequence_ReservedNextBanc and _StartPosName: the game's String64 setter,
+                                              (mgr, const char **value, hash), queued; the texts and their pointers stay) */
+        A64Fn set_string = a64_lookup(0x80d44e50ULL);
+        const uint64_t mgr = oot_singleton(c, OOT_GAMEDATA_SLOT);
+        if (set_string && mgr) {
+            recomp_store64(c, strings + 384, strings), recomp_store64(c, strings + 392, strings + 128);
+            const uint32_t hashes[2] = {0xee27bf71u, 0x0b570ab2u};
+            for (unsigned i = 0; i < 2; i++) {
+                c->x[31] = (saved.x[31] - 0x200) & ~0xfULL;
+                c->x[0] = mgr, c->x[1] = strings + 384 + 8 * i, c->x[2] = hashes[i], c->x[30] = 0;
+                set_string(c);
+                *c = saved;
+            }
+        } else {
+            hos_log("cheats: teleport: the game's String64 setter is not in this build: the warp stays where it is");
         }
     }
     teleport.requested_at = now;
@@ -1257,6 +1330,54 @@ static int oot_toggle_age(Ctx *c, uint64_t actor) {
         return 0;
     }
     return 1;
+}
+
+/* The Teleport places' data from the player's dump (teleport_places.bin, nx2/teleport_places.py), read once: by main before
+   the game's thread starts, so the game's thread only finds it read */
+static const OotTpPlaceData *oot_places_data(void) {
+    static OotTpPlaceData data[OOT_TP_PLACES];
+    static int read;
+    if (!read) {
+        read = 1;
+        char path[MAX_PATH + 32];
+        const DWORD n = hos_game_path_a(path, MAX_PATH);
+        char *slash = n ? strrchr(path, SEP) : NULL;
+        if (slash) snprintf(slash + 1, (size_t)(path + sizeof path - slash - 1), "teleport_places.bin");
+        const int found = slash ? oot_tp_places_read(path, data) : 0;
+        hos_log("cheats: Teleport places: %d of %d from teleport_places.bin%s", found, OOT_TP_PLACES,
+                found ? "" : " (none: the places arrive with the plain event, no screenshots taken)");
+    }
+    return data;
+}
+
+/* A Teleport place (gpu/vk/oot_tp_places.h) in the age asked for: Sequence_IsChildhood set first when it differs (as the age
+   toggle does), then the map change to the place's arrival point with its arrival event (a destination's own where it is that
+   very point, else the dump's; another point's event left the screen black) */
+static int oot_travel_place(Ctx *c, uint64_t actor, unsigned index, int adult) {
+    if (index >= (unsigned)OOT_TP_PLACES) return 0;
+    const OotTpPlace *p = &oot_tp_places[index];
+    const char *boot = oot_places_data()[index].event;   /* ("": no ordinary arrival: the carrier warp) */
+    for (unsigned i = 0; i < sizeof oot_destinations / sizeof oot_destinations[0]; i++) {
+        const OotDestination *d = &oot_destinations[i];
+        if (d->child_banc && !strcmp(d->child_banc, p->banc) && !strcmp(d->child_start, p->spawn)) boot = d->child_boot;
+        else if (d->adult_banc && !strcmp(d->adult_banc, p->banc) && !strcmp(d->adult_start, p->spawn)) boot = d->adult_boot;
+    }
+    int child = 1;
+    const int known = oot_gamedata_bool(c, 0xcea220d3u, &child);
+    const int switch_age = known && child == adult;
+    if (switch_age && !oot_gamedata_set_bool(c, 0xcea220d3u, !adult)) {
+        hos_log("cheats: place %s: could not write Sequence_IsChildhood", p->label);
+        return 0;
+    }
+    hos_log("cheats: place '%s' (%s), %s%s: map %s at %s, arriving with %s", p->label, p->key, adult ? "adult" : "child",
+            switch_age ? " (age switched)" : "", p->banc, p->spawn, boot);
+    place_target.banc = p->banc, place_target.start = p->spawn, place_target.boot = boot;
+    place_target.carrier = !boot[0];   /* (a warp's or a scene's point: arrived at by the carrier warp) */
+    if (place_target.carrier) boot = "", place_target.boot = "DefaultParentEvent";
+    const int sent = oot_teleport(c, actor, 0);
+    place_target.banc = NULL;
+    if (!sent && switch_age) oot_gamedata_set_bool(c, 0xcea220d3u, child);
+    return sent;
 }
 
 static void oot_teleport_followup(Ctx *c) {
@@ -1447,6 +1568,65 @@ static int oot_flight_moved_away(Ctx *c, uint64_t actor, const float held[3]) {
     return apart > 2.0f * 2.0f;
 }
 
+/* The Teleport places' screenshots (gpu/vk/vk_menu.cpp): the place of this map nearest Link is the one a retake takes
+   (OOT_TP_MAP_ID); once Link has stayed 3 s within OOT_PLACE_NEAR of the same place, with no map loading and no event
+   playing, the menu is told (OOT_TP_CAPTURE_ID) and takes the picture if it has none of that place yet. Told again only
+   after another place. Runs with the player's update, which stops while the game is paused; and only while the menu takes
+   screenshots (HOS_OPT_TELEPORT_PICTURES: once the Travel page has been opened), so no one else's game folder gets pictures
+   for a page they never open. */
+#define OOT_PLACE_NEAR 40.0f   /* (an entrance's arrival leaves Link walked in ~26 from its point) */
+static void oot_capture_tick(Ctx *c, uint64_t actor, int64_t now) {
+    int rx_option(int id, int otherwise);
+    void rx_option_set(int id, int value);
+    static char banc[64];
+    static int64_t since;
+    static int told = 1, place = -1, retake = -2;
+    char now_banc[64];
+    if (!rx_option(HOS_OPT_TELEPORT_PICTURES, 0)) {
+        if (banc[0]) banc[0] = 0, rx_option_set(OOT_TP_MAP_ID, -1);   /* (switched on again: the map Link is in starts over) */
+        return;
+    }
+    if (!oot_gamedata_string(c, 0x1d6189dau, now_banc, sizeof now_banc) || !now_banc[0]) return;   /* Sequence_CurrentBanc */
+    int loading = 0;
+    const uint64_t events = oot_singleton(c, OOT_EVENTMGR_SLOT);
+    const int busy = !events || recomp_load64(c, events + 104) ||
+                     (oot_gamedata_bool(c, 0xef2b60c2u, &loading) && loading);   /* an event, Sequence_IsLoadingBanc */
+    if (strcmp(now_banc, banc)) {
+        snprintf(banc, sizeof banc, "%s", now_banc);
+        since = now, told = 0, place = -1;
+        if (retake != -1) retake = -1, rx_option_set(OOT_TP_MAP_ID, -1);   /* (no retake until settled here) */
+        return;
+    }
+    if (busy) {
+        since = now;
+        return;
+    }
+    float at[3];
+    for (unsigned i = 0; i < 3; i++) at[i] = oot_load_float(c, actor + 796 + i * 4);
+    int nearest = -1;
+    float best = 0;
+    for (int i = 0; i < OOT_TP_PLACES; i++) {
+        if (strcmp(oot_tp_places[i].banc, banc)) continue;
+        const OotTpPlaceData *pd = &oot_places_data()[i];
+        if (!pd->found) continue;   /* (not in teleport_places.bin: no position. A place warped to has no event, but has one) */
+        const float dx = at[0] - pd->pos[0], dy = at[1] - pd->pos[1], dz = at[2] - pd->pos[2];
+        const float d = dx * dx + dy * dy + dz * dz;
+        if (nearest < 0 || d < best) nearest = i, best = d;
+    }
+    if (nearest != retake && now - since >= 1000000000LL) {
+        retake = nearest;
+        rx_option_set(OOT_TP_MAP_ID, nearest);   /* (the place a retake takes: the Retake picture button) */
+        if (nearest >= 0)
+            hos_log("cheats: nearest place '%s' (%s), %.1f away; Link at %.2f %.2f %.2f", oot_tp_places[nearest].label,
+                    oot_tp_places[nearest].key, sqrtf(best), at[0], at[1], at[2]);
+    }
+    const int near_place = nearest >= 0 && best <= OOT_PLACE_NEAR * OOT_PLACE_NEAR ? nearest : -1;
+    if (near_place != place) place = near_place, since = now, told = 0;
+    if (place < 0 || told || now - since < 3000000000LL) return;
+    told = 1;
+    rx_option_set(OOT_TP_CAPTURE_ID, place);
+}
+
 /* Wall climb (the Debug tab's row, HOS_OPT_CHEAT_WALL_CLIMB): Link walked into something he cannot pass, the stick still
    pushing him at it, climbs up it (and a little forward, onto ledges) until he can walk on (over the top), the stick lets go or turns away. The game's
    own climbing needs a vine's data that a plain wall has not, so this lifts him instead, through the controller's change
@@ -1569,6 +1749,7 @@ static void oot_update_player_cheats(Ctx *c, uint64_t actor, uint64_t components
     oot_inventory_refresh(c, now);
     oot_player_speed(c, components);
     oot_map_refresh(c, now);
+    oot_capture_tick(c, actor, now);   /* (hookshot: the Travel page's pictures) */
     if (action >= OOT_CHEAT_ITEM_ACTION && action < OOT_CHEAT_ITEM_ACTION + 256 * (int)OOT_ITEM_COUNT) {
         oot_inventory_edit(c, action);
     } else if (action == OOT_AGE_ACTION) {
@@ -1580,6 +1761,8 @@ static void oot_update_player_cheats(Ctx *c, uint64_t actor, uint64_t components
             const int sent = oot_toggle_age(c, actor);
             if (bridge_ticket) oot_bridge_teleport_done(bridge_ticket, sent);
         }
+    } else if (action >= OOT_PLACE_ACTION && action < OOT_PLACE_ACTION + 2 * OOT_TP_PLACES) {   /* (hookshot: the Travel page) */
+        oot_travel_place(c, actor, (unsigned)(action - OOT_PLACE_ACTION) / 2, (action - OOT_PLACE_ACTION) & 1);
     } else if (action >= OOT_TELEPORT_ACTION) {
         const int sent = oot_teleport(c, actor, (unsigned)(action - OOT_TELEPORT_ACTION));
         if (bridge_ticket) oot_bridge_teleport_done(bridge_ticket, sent);
@@ -2088,6 +2271,7 @@ static int game_main(int argc, char **argv) {
         hos_relaunch_keep_env();
     }
     load_hookshot_env();
+    oot_places_data();   /* (hookshot: the Travel places' file read here, before the game's code runs: the game's thread reads no file) */
 #endif
     /* (the settings file, in the user folder: chosen before the crash window's helper, the Discord status and the renderer read
        it, and after hookshot_env.txt, which may set HOS_OPTIONS_FILE; Linux's main chose it already: host/options_path.c) */
@@ -2165,6 +2349,10 @@ static int game_main(int argc, char **argv) {
     void hos_crash_watch_start(int argc, char **argv);
     hos_crash_watch_start(argc, argv);
     if (hookshot_env_note[0]) hos_log("%s", hookshot_env_note);   /* (what hookshot_env.txt gave) */
+#ifdef __linux__
+    if (submit_thread_note[0])   /* (decided in main, before any thread: submit_thread_at_start) */
+        hos_log("env: Mesa's submit thread %s", submit_thread_note);
+#endif
     const char *image = NULL;
     /* (hookshot) --compile-shaders all or most: what a preparation of this run builds (gpu/vk/vk_draw.cpp compile_all), over
        compile_shaders= in hookshot_options.ini; as RX_VK_COMPILE_SHADERS, set before --prepare-shaders runs, wherever it stands */
@@ -2351,6 +2539,7 @@ static int game_main(int argc, char **argv) {
     uint64_t sp = c->x[31];
     void hos_prof_start(void);
     hos_prof_start();   /* HOS_PROFILE=<seconds> */
+    hos_jt_start();     /* HOS_JOBTRACE=<path>: the guest threads' blocking and waking, a short window (hos_jobtrace.c) */
     void hos_chain_start(void);
     hos_chain_start();  /* HOS_CHAIN=<path> */
 #ifdef _WIN32
@@ -2484,6 +2673,12 @@ int main(int argc, char **argv) {
     driver_cache_room();
     driver_cache_folder();
     driver_env_choose();
+#ifdef __linux__
+    /* (after hookshot_env.txt, which may set RX_VK_RADV_SUBMIT_THREAD, and before hos_display_init's SDL_Init, the first
+       thread: its setenv is safe only while this is the one thread. HL_TRACE's dump threads, a constructor's, are the one
+       exception, as for load_hookshot_env's own setenv) */
+    submit_thread_at_start();
+#endif
     game_argc = argc, game_argv = argv;
     int prepare_shaders = 0;
     for (int i = 1; i < argc; i++) {

@@ -54,6 +54,7 @@ NOTED_BY = {
     "the dry pass (a draw's target)": ("gpu/vk/vk_draw.cpp", "dry_mark_written: the dry pass"),
     "the dry pass (a draw's depth)": ("gpu/vk/vk_draw.cpp", "dry_mark_written: the dry pass"),
     "the dry pass (a dispatch's storage image)": ("gpu/vk/vk_draw.cpp", "dry_mark_written: the dry pass"),
+    "the dry pass (a texture copy's destination)": ("gpu/vk/vk_xfer.cpp", "dry_mark_copy_target: ParLock held by the replay case"),
     "a buffer-to-texture copy": ("gpu/vk/vk_xfer.cpp", "copy_b2t: the ParLock of NOP_COPY_B2T and NOP_COPY_T2B "
                                  "(vk_replay.cpp)"),
     "a copy into a BC texture": ("gpu/vk/vk_xfer.cpp", "copy_t2t: the ParLock of NOP_COPY_T2T (vk_replay.cpp)"),
