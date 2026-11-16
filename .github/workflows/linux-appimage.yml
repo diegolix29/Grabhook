@@ -8,7 +8,8 @@
 name: Linux AppImage
 on:
   push:
-    branches: [main]
+    # (Fork: the fork's working branch, built and checked. nightly: also the nightly prerelease, as main)
+    branches: [main, Fork, nightly]
     tags: ['*']
   # (not for a pull request that changes only documentation or the release manifest: nothing of them is compiled or
   # packaged but readme.md, which is only copied in. A push to main builds every time)
@@ -41,8 +42,8 @@ jobs:
     # (nightly is moved forward by the release job of a push to main, here or in the Windows builder workflow, and rc by
     # the Release workflow: never built as a tag)
     if: >-
-      github.ref_name != 'builder-parts' && github.ref_name != 'linux-parts' && github.ref_name != 'nightly'
-      && github.ref_name != 'rc'
+      github.ref != 'refs/tags/builder-parts' && github.ref != 'refs/tags/linux-parts' && github.ref != 'refs/tags/nightly'
+      && github.ref != 'refs/tags/rc'
     runs-on: ubuntu-latest
     container: ubuntu:22.04
     # (about 4 minutes with the dependencies cached; building them all, as a release does, takes longer)
@@ -172,7 +173,7 @@ jobs:
           # describe could name instead)
           HOOKSHOT_VERSION: ${{ env.RELEASE_TAG }}
           HOOKSHOT_UPDATE_RELEASE: >-
-            ${{ env.RELEASE_TAG == '' && github.event_name == 'push' && github.ref == 'refs/heads/main' && 'nightly'
+            ${{ env.RELEASE_TAG == '' && github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/nightly') && 'nightly'
             || contains(env.RELEASE_TAG, '-') && 'rc' || 'latest' }}
         run: scripts/linux/appimage.sh
 
@@ -201,13 +202,15 @@ jobs:
           key: ${{ steps.objkey.outputs.key }}
 
       # (AMD FSR 4's Linux side, a build option the AppImage leaves off (gpu/vk/vk_fsr4.cpp: dlopen, the older backend
-      # description, the unit exposure; the descriptor buffers in vk_main.cpp): built once more in a copy of the back end's
-      # work folder, where only vk_fsr4.cpp compiles again. The AppImage above is not changed)
+      # description, the unit exposure; the descriptor buffers in vk_main.cpp): built in a work folder of its own. The
+      # AppImage builds no back end since #574, so there is no build-linux/vk-work to start from unless an object cache was
+      # restored into it: its objects are taken when they are there. The AppImage above is not changed)
       - name: hookshot_vk.so with AMD FSR 4 (build check)
         shell: bash   # (this container's default is sh, which has no PIPESTATUS)
         run: |
-          cp -r build-linux/vk-work "$RUNNER_TEMP/vk-fsr"
-          rm -f "$RUNNER_TEMP/vk-fsr/sa/build/hookshot_vk.so"   # (the AppImage's own, without FSR: the test below is this build's)
+          rm -rf "$RUNNER_TEMP/vk-fsr"
+          mkdir -p "$RUNNER_TEMP/vk-fsr"
+          if [ -d build-linux/vk-work/objcache ]; then cp -r build-linux/vk-work/objcache "$RUNNER_TEMP/vk-fsr/"; fi
           D="$PWD/build-linux/deps"
           OOT_WORK="$RUNNER_TEMP/vk-fsr" EMSDK="$D/emsdk" RX_CPM="$D/cpm" RX_MARCH=x86-64-v3 RX_VK_ONLY=1 RX_RELEASE=1 HOOKSHOT_FSR=1 \
             "$D/python/bin/python3" -I nx2/build.py --standalone --jobs "$(nproc)" |
@@ -217,7 +220,7 @@ jobs:
           test -f "$RUNNER_TEMP/vk-fsr/sa/build/hookshot_vk.so"
 
       # (a release's or the nightly's files, signed as built by this run: gh attestation verify <file> -R <this repository>)
-      - if: env.RELEASE_TAG != '' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+      - if: env.RELEASE_TAG != '' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/nightly'))
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: |
@@ -241,7 +244,7 @@ jobs:
 
       # (the update parts of a release or of the nightly, for the release job: scripts/linux/make_parts.py. Not on other
       # runs: about 240 MB)
-      - if: env.RELEASE_TAG != '' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+      - if: env.RELEASE_TAG != '' || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/nightly'))
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: Hookshot-linux-parts
@@ -253,7 +256,7 @@ jobs:
     if: >-
       inputs.tag != '' || (startsWith(github.ref, 'refs/tags/') && github.ref_name != 'builder-parts'
       && github.ref_name != 'linux-parts' && github.ref_name != 'nightly' && github.ref_name != 'rc')
-      || (github.event_name == 'push' && github.ref == 'refs/heads/main')
+      || (github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/nightly'))
     needs: appimage
     runs-on: ubuntu-24.04
     timeout-minutes: 15
@@ -268,6 +271,8 @@ jobs:
       RELEASE_SUMS_OUT: dist/SHA256SUMS
       # (called by the Release workflow: its draft is there already, and no release is made here)
       RELEASE_FROM_WORKFLOW: ${{ inputs.tag && 'true' || 'false' }}
+      # (the branch the nightly follows: main, or the nightly branch: scripts/release_upload.sh)
+      NIGHTLY_BRANCH: ${{ github.ref_name }}
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

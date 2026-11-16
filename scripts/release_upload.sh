@@ -77,7 +77,7 @@ advance_nightly() {
                 return 1 ;;
             diverged)
                 # (main was rewritten, and the tag holds a commit no longer on it: main's newest commit takes it)
-                head=$(gh api "repos/$GH_REPO/commits/main" --jq .sha)
+                head=$(gh api "repos/$GH_REPO/commits/${NIGHTLY_BRANCH:-main}" --jq .sha)
                 if [[ $head != "$sha" ]]; then
                     echo "nightly: it holds $held, not before $sha, which is not main's newest ($head): left as it is"
                     return 1
@@ -97,7 +97,7 @@ if [[ $tag == nightly ]]; then
     advance_nightly "$sha" || exit 0
     # (the same notes from every run: the two platforms' runs write them at different times, and each file names the
     # commit it was built from)
-    notes="The latest development build of main, made by CI after every push to main. Each file is named by the commit it was built from (\`Hookshot-<version>-x86_64.AppImage\`, \`Hookshot-<version>-Windows-x64.zip\`; the version is \`git describe\`'s, ending in \`-g<commit>\`). The Windows and Linux builds finish at different times, so while changes are being merged one can be a commit or two behind the other; the \`nightly\` tag is at the newest of them.
+    notes="The latest development build of main, made by CI after every push to ${NIGHTLY_BRANCH:-main}. Each file is named by the commit it was built from (\`Hookshot-<version>-x86_64.AppImage\`, \`Hookshot-<version>-Windows-x64.zip\`; the version is \`git describe\`'s, ending in \`-g<commit>\`). The Windows and Linux builds finish at different times, so while changes are being merged one can be a commit or two behind the other; the \`nightly\` tag is at the newest of them.
 
 It is untested and may break your saves or settings. For playing, use the [latest release](https://github.com/$GH_REPO/releases/latest).
 

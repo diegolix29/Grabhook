@@ -758,6 +758,7 @@ class ReleaseScripts(unittest.TestCase):
         # (a tag named rc is never built: the Release workflow moves it)
         for name in ("linux-appimage.yml", "windows-builder.yml"):
             text = (ROOT / ".github/workflows" / name).read_text(encoding="utf-8")
+            self.assertEqual(text.count("github.ref != 'refs/tags/nightly'"), text.count("github.ref != 'refs/tags/rc'"), name)
             self.assertEqual(text.count("github.ref_name != 'nightly'"), text.count("github.ref_name != 'rc'"), name)
 
 
