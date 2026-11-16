@@ -2942,7 +2942,7 @@ std::unordered_map<uint64_t, Parked> parked;   // (evicted_key -> its texels)
 uint64_t parked_bytes = 0;
 std::atomic<int64_t> st_parked{0}, st_restored{0}, st_park_dropped{0}, st_park_stale{0};
 uint64_t park_cap() {
-    static const uint64_t cap = [] {
+    static const uint64_t cap = []() -> uint64_t {
         if (const char* e = getenv("RX_VK_PARK_MB")) return (uint64_t)std::max(0, atoi(e)) << 20;
         uint64_t ram = 0;
 #ifdef _WIN32

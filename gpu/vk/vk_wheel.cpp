@@ -325,42 +325,25 @@ struct TextMask {
     int w = 0, h = 0;
     std::vector<uint8_t> cov;
 };
+#ifdef _WIN32
 HFONT text_font(int px) {
     return CreateFontA(-px, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY,
                        DEFAULT_PITCH, "Segoe UI");
 }
-#ifdef _WIN32
 std::wstring wide(const char* s) {
     const int n = MultiByteToWideChar(CP_UTF8, 0, s, -1, nullptr, 0);
     std::wstring w(n > 0 ? n - 1 : 0, L'\0');
     if (n > 1) MultiByteToWideChar(CP_UTF8, 0, s, -1, w.data(), n);
     return w;
 }
-#else
-std::string latin1(const char* s) {   // (the POSIX GDI stand-in draws a byte a letter: Latin-1, '?' past it)
-    std::string o;
-    for (const unsigned char* p = (const unsigned char*)s; *p;) {
-        unsigned cp = *p, n = cp < 0x80 ? 1 : (cp >> 5) == 6 ? 2 : (cp >> 4) == 14 ? 3 : 4;
-        if (n == 2 && p[1]) cp = (cp & 31) << 6 | (p[1] & 63);
-        for (unsigned k = 0; k < n && *p; k++) p++;
-        o += cp < 256 && (n <= 2) ? (char)cp : '?';
-    }
-    return o;
-}
-#endif
 // the size of text at px pixels
 void text_size(const char* s, int px, int* w, int* h) {
     HDC dc = CreateCompatibleDC(nullptr);
     HFONT f = text_font(px);
     HGDIOBJ old = SelectObject(dc, f);
     SIZE sz{};
-#ifdef _WIN32
     const std::wstring t = wide(s);
     GetTextExtentPoint32W(dc, t.c_str(), (int)t.size(), &sz);
-#else
-    const std::string t = latin1(s);
-    GetTextExtentPoint32A(dc, t.c_str(), (int)t.size(), &sz);
-#endif
     SelectObject(dc, old);
     DeleteObject(f);
     DeleteDC(dc);
@@ -393,13 +376,8 @@ TextMask text_mask(const char* s, int px, int pad) {
     HGDIOBJ old = SelectObject(dc, f);
     SetBkMode(dc, TRANSPARENT);
     SetTextColor(dc, RGB(255, 255, 255));
-#ifdef _WIN32
     const std::wstring t = wide(s);
     TextOutW(dc, pad + 1, pad + 1, t.c_str(), (int)t.size());
-#else
-    const std::string t = latin1(s);
-    TextOutA(dc, pad + 1, pad + 1, t.c_str(), (int)t.size());
-#endif
     GdiFlush();
     m.cov.resize((size_t)m.w * m.h);
     const uint32_t* p = (const uint32_t*)bits;
@@ -414,6 +392,15 @@ TextMask text_mask(const char* s, int px, int pad) {
     DeleteDC(dc);
     return m;
 }
+#else
+// POSIX stub: text rendering not implemented
+void text_size(const char* s, int px, int* w, int* h) {
+    *w = *h = 0;
+}
+TextMask text_mask(const char* s, int px, int pad) {
+    return TextMask{};
+}
+#endif
 // text with a dark outline o pixels wide, centred on (cx, cy)
 void text(Canvas& c, const char* s, int px, float cx, float cy, const Rgba& col, int o) {
     if (!*s) return;
