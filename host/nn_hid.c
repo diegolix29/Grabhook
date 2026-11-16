@@ -905,6 +905,7 @@ static uint64_t flight_input;
 static uint64_t free_camera_axes;
 static int free_camera_height;
 static int move_stick_held;   /* (the left stick pushed as the game got it: hos_move_stick_held) */
+static uint64_t move_stick_axes;   /* (the same stick, x then y as int16: hos_move_stick, the Debug tab's Wall climb) */
 
 uint64_t hos_flight_input(void) {
     return __atomic_load_n(&flight_input, __ATOMIC_RELAXED);
@@ -913,6 +914,13 @@ uint64_t hos_flight_input(void) {
 /* The left stick as the game got it is pushed (the Debug tab's Movement speed scales Link only while the player steers him: not a
    scene's walk) */
 int hos_move_stick_held(void) { return __atomic_load_n(&move_stick_held, __ATOMIC_RELAXED); }
+
+/* The left stick as the game got it: x in the low 16 bits, y (up positive) in the next, each an int16 */
+uint64_t hos_move_stick(void) { return __atomic_load_n(&move_stick_axes, __ATOMIC_RELAXED); }
+
+/* Whether a button other than A (the sprint) is held as the game got them: an attack, a shield, a target (Wall climb waits) */
+static int other_buttons_held;
+int hos_other_buttons_held(void) { return __atomic_load_n(&other_buttons_held, __ATOMIC_RELAXED); }
 
 uint64_t hos_free_camera_input(int *height) {
     *height = __atomic_load_n(&free_camera_height, __ATOMIC_RELAXED);
@@ -1244,6 +1252,8 @@ static void npad_states(Ctx *c) {
         }
         __atomic_store_n(&flight_input, flight, __ATOMIC_RELAXED);
         __atomic_store_n(&move_stick_held, abs(stick[0]) > 4096 || abs(stick[1]) > 4096, __ATOMIC_RELAXED);
+        __atomic_store_n(&other_buttons_held, (buttons & 0xffffULL & ~(1ULL << B_A)) != 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&move_stick_axes, (uint64_t)(uint16_t)stick[0] | (uint64_t)(uint16_t)stick[1] << 16, __ATOMIC_RELAXED);
         __atomic_store_n(&free_camera_axes, axes, __ATOMIC_RELAXED);
         __atomic_store_n(&free_camera_height, height, __ATOMIC_RELAXED);
     }

@@ -1447,6 +1447,99 @@ static int oot_flight_moved_away(Ctx *c, uint64_t actor, const float held[3]) {
     return apart > 2.0f * 2.0f;
 }
 
+/* Wall climb (the Debug tab's row, HOS_OPT_CHEAT_WALL_CLIMB): Link walked into something he cannot pass, the stick still
+   pushing him at it, climbs up it (and a little forward, onto ledges) until he can walk on (over the top), the stick lets go or turns away. The game's
+   own climbing needs a vine's data that a plain wall has not, so this lifts him instead, through the controller's change
+   of position as the flight does; the game keeps walking him into the wall meanwhile, and his first steps forward that
+   get anywhere are the top. Units are the game's metres. */
+#define WALL_CLIMB_SPEED 2.5f       /* metres a second up the wall */
+#define WALL_CLIMB_FORWARD 0.6f     /* and into it: straight up left him under ledges that stick out, short of the top */
+#define WALL_CLIMB_BLOCKED 0.7f     /* seconds of pushing into it, getting nowhere, before he climbs (an enemy in the way
+                                       moves or is beaten sooner than that) */
+static int oot_wall_climb(Ctx *c, uint64_t actor, uint64_t components, int64_t now) {
+    int rx_option(int id, int otherwise);
+    uint64_t hos_move_stick(void);   /* host/nn_hid.c */
+    int hos_other_buttons_held(void);
+    static uint64_t climb_actor;
+    static int climbing;
+    static int64_t last;
+    static float prev[3], dir[2], height, blocked, free_time, climbed;
+    float pos[3];
+    for (unsigned i = 0; i < 3; i++) pos[i] = oot_load_float(c, actor + 796 + i * 4);
+    const float dt = (float)(now - last) * 1e-9f;
+    last = now;
+    const int on = rx_option(HOS_OPT_CHEAT_WALL_CLIMB, 0) > 0 && !oot_event_playing(c) && !rx_option(1, 0);
+    if (!on || climb_actor != actor || !(dt > 0) || dt > 0.25f) {
+        if (climbing) hos_log("cheats: wall climb stopped (%s)", on ? "a pause" : "switched off or an event");
+        climbing = 0;
+        blocked = 0;
+        climb_actor = actor;
+        memcpy(prev, pos, sizeof prev);
+        return 0;
+    }
+    /* the stick in the world, as the flight turns it: the camera's view across the ground */
+    const uint64_t axes = hos_move_stick();
+    const float right = (int16_t)axes / 32767.0f, forward = (int16_t)(axes >> 16) / 32767.0f;
+    const float push = hypotf(right, forward);
+    float rx = 1, rz = 0;
+    const uint64_t view = oot_gameplay_view(c);
+    if (view && recomp_load64(c, view) == 0x84c18a88ULL) {
+        const float x = oot_load_float(c, view + 8), z = oot_load_float(c, view + 16);
+        const float length = hypotf(x, z);
+        if (length > 0.01f) rx = x / length, rz = z / length;
+    }
+    float want[2] = {rx * right + rz * forward, rz * right - rx * forward};
+    if (push > 0.01f) want[0] /= push, want[1] /= push;
+    const float moved[2] = {pos[0] - prev[0], pos[2] - prev[2]};
+    memcpy(prev, pos, sizeof prev);
+    if (!climbing) {
+        const float along = (moved[0] * want[0] + moved[1] * want[1]) / dt;
+        /* only walking into it: an attack, the shield or a target held (a fight) never starts a climb */
+        blocked = push > 0.6f && along < 0.25f && !hos_other_buttons_held() ? blocked + dt : 0;
+        if (blocked < WALL_CLIMB_BLOCKED) return 0;
+        climbing = 1;
+        dir[0] = want[0], dir[1] = want[1];
+        height = pos[1];
+        free_time = climbed = 0;
+        hos_log("cheats: wall climb from %.2f %.2f %.2f", pos[0], pos[1], pos[2]);
+    }
+    const float along = (moved[0] * dir[0] + moved[1] * dir[1]) / dt;
+    free_time = along > 1.0f ? free_time + dt : 0;
+    const char* why = push < 0.3f ? "the stick let go"
+                      : want[0] * dir[0] + want[1] * dir[1] < 0.5f ? "the stick turned away"
+                      : free_time > 0.1f ? "over the top"
+                      : climbed > 200.0f ? "too high" : NULL;
+    if (why) {
+        climbing = 0;
+        blocked = 0;
+        hos_log("cheats: wall climb ended at %.2f %.2f %.2f, %.2f m up: %s", pos[0], pos[1], pos[2], climbed, why);
+        return 0;
+    }
+    height += WALL_CLIMB_SPEED * dt;
+    climbed += WALL_CLIMB_SPEED * dt;
+    /* (as the flight does it) OneShotPhysicsCctChangePosition on Link's controller, his own x and z, the climb's height */
+    const uint64_t controller = oot_player_controller(c, components);
+    if (!controller || recomp_load64(c, 0x84c54f10ULL + 0xe8) != 0x806d2530ULL) return 1;
+    A64Fn change_position = a64_lookup(0x806d2530ULL);
+    if (!change_position) return 1;
+    const float target[3] = {pos[0] + dir[0] * WALL_CLIMB_FORWARD * dt, height, pos[2] + dir[1] * WALL_CLIMB_FORWARD * dt};
+    const Ctx saved = *c;
+    const uint64_t arg = c->x[31] - 16;
+    for (unsigned i = 0; i < 3; i++) {
+        uint32_t bits;
+        memcpy(&bits, &target[i], sizeof bits);
+        recomp_store32_sp(c, arg + i * 4, bits);
+    }
+    recomp_store32_sp(c, arg + 12, 0);
+    c->x[31] = arg;
+    c->x[0] = controller;
+    c->x[1] = arg;
+    change_position(c);
+    *c = saved;
+    prev[1] = height;
+    return 1;
+}
+
 static void oot_update_player_cheats(Ctx *c, uint64_t actor, uint64_t components) {
     int rx_option(int id, int otherwise);
     static uint64_t flying_actor, marked_actor, marked_controller;
@@ -1499,6 +1592,7 @@ static void oot_update_player_cheats(Ctx *c, uint64_t actor, uint64_t components
     } else if (action >= 100 && action < 124) {
         oot_set_time(c, action - 100);
     }
+    if (!flying) oot_wall_climb(c, actor, components, now);
     if (!flying && action != 2 && action != 3) return;
 
     // Follow OneShotPhysicsCctChangePosition to Link's controller.

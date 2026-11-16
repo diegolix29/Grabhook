@@ -1692,6 +1692,8 @@ Row rows[] = {
      "Enter opens the inventory editor: unlock or relock equipment, items, upgrades and quest items, and change amounts.", nullptr, false, true, 10},
     {TAB_DEBUG, "Movement speed", nullptr, 0, 0, 0, nullptr,
      "How fast Link walks, runs and swims, as a multiple of his own speed. Choose with Left or Right.", nullptr, false, true, 11},
+    {TAB_DEBUG, "Wall climb", nullptr, 0, 0, 0, nullptr,
+     "Keep walking into a wall and Link climbs straight up it, onto the top. Let go of the stick to drop.", nullptr, false, true, 13},
     {TAB_DEBUG, "Rupees", nullptr, 0, 0, 0, nullptr,
      "Choose how many rupees to add or remove with Left or Right; Link's rupees now are in brackets. Enter applies the change, "
      "up to what his wallet holds.", nullptr, false, true, 12},
@@ -1761,6 +1763,7 @@ std::atomic<int> protect_hearts{-1};
 // -1 disables the shortcut, 0 enables it on the ground, and 1 means flying.
 std::atomic<int> player_flight{-1};
 std::atomic<int> free_camera{0};
+std::atomic<int> wall_climb{0};   // (Wall climb: Link goes up a wall he walks into, HOS_OPT_CHEAT_WALL_CLIMB)
 std::atomic<int> cheat_action{0};
 std::atomic<int> link_age{-1};
 // (Movement speed: the choice, an index of link_speeds; the game side reads it in percent, HOS_OPT_CHEAT_SPEED)
@@ -1894,7 +1897,7 @@ void choose_inventory_filter(int filter) {
     inventory_amount = false;
     inventory_reveal();
 }
-constexpr int kCheatRows = 13;   // (the debug tools' rows: Row::cheat 0 to 12)
+constexpr int kCheatRows = 14;   // (the debug tools' rows: Row::cheat 0 to 13)
 /// A debug tool's value as its row shows it ("" an action: confirm does it)
 std::string cheat_value(int i) {
     char t[32];
@@ -1905,6 +1908,7 @@ std::string cheat_value(int i) {
     case 5: return pouch_items[pouch_item];
     case 6: return snprintf(t, sizeof t, "%+d", pouch_delta), t;
     case 7: return tx_onoff(free_camera.load());
+    case 13: return tx_onoff(wall_climb.load());
     case 11: return link_speed_names[std::clamp(link_speed.load(), 0, kLinkSpeeds - 1)];
     case 12: {   // (the amount, and Link's rupees now once the game side has said them)
         const int have = link_rupees.load(std::memory_order_relaxed);
@@ -1922,12 +1926,12 @@ bool age_shown(int i) { return i == 9 && link_age.load(std::memory_order_relaxed
 /// What confirm does on a tool's row, for its prompt (nullptr: nothing)
 const char* cheat_confirm(int i) {
     static const char* const says[kCheatRows] = {"Toggle", "Toggle", "Apply", "Apply", "Set", nullptr, "Apply", "Toggle", "Open list",
-                                                 "Switch", "Open", nullptr, "Apply"};
+                                                 "Switch", "Open", nullptr, "Apply", "Toggle"};
     return i >= 0 && i < kCheatRows ? says[i] : nullptr;
 }
 /// The button label on an action tool's row ("": not a button action)
 const char* cheat_button_text(int i) {
-    static const char* const buttons[kCheatRows] = {"", "", "Mark", "Return", "", "", "", "", "Choose map", "Switch", "Edit items", "", ""};
+    static const char* const buttons[kCheatRows] = {"", "", "Mark", "Return", "", "", "", "", "Choose map", "Switch", "Edit items", "", "", ""};
     return i >= 0 && i < kCheatRows ? buttons[i] : "";
 }
 constexpr int kRows = sizeof rows / sizeof rows[0];
@@ -3472,8 +3476,8 @@ std::string restart_line(ui::Ctx& c, float px, float width) {
 /// and Change quantity are not shown (the Inventory page edits every amount)
 struct DebugGroup { const char* title; int from, to; };   // (debug_tools_order[from, to))
 // (-1 is the saved Damage taken option, not a cheat action: beside Heart protection in Player)
-constexpr int debug_tools_order[] = {0, -1, 1, 11, 9, 10, 12, 8, 2, 3, 7, 4};
-constexpr DebugGroup debug_groups[] = {{"Player", 0, 7}, {"Travel", 7, 10}, {"Camera & world", 10, 12}};
+constexpr int debug_tools_order[] = {0, -1, 1, 11, 13, 9, 10, 12, 8, 2, 3, 7, 4};
+constexpr DebugGroup debug_groups[] = {{"Player", 0, 8}, {"Travel", 8, 11}, {"Camera & world", 11, 13}};
 constexpr int kDebugGroups = sizeof debug_groups / sizeof debug_groups[0];
 constexpr int kDebugGeneralRows = 2;
 constexpr int kDebugTools = sizeof debug_tools_order / sizeof debug_tools_order[0];
@@ -3729,7 +3733,7 @@ const char* bug_report_hint() {
 
 const char* const tab_titles[TAB_COUNT] = {"Graphics", "Audio", "Gameplay", "Controls", "Mods", "Debug"};
 inline const char* tab_title(int t) { return t >= 0 && t < TAB_COUNT ? tab_titles[t] : "Settings"; }
-inline bool cheat_is_toggle(int c) { return c == 0 || c == 1 || c == 7; }
+inline bool cheat_is_toggle(int c) { return c == 0 || c == 1 || c == 7 || c == 13; }
 
 /// Draws a row's value cell (slider, toggle, choice, or subpage arrow), shared between the full menu and tuning bar
 void row_value_cell(ui::Ctx& c, const Row& r, ImVec2 va, ImVec2 vb, bool selected, float* t0, float* t1) {
@@ -5510,6 +5514,7 @@ int menu_heart_protection() {
 }
 int menu_player_flight() { return cheats_on() ? player_flight.load(std::memory_order_relaxed) : -1; }
 int menu_free_camera() { return cheats_on() ? free_camera.load(std::memory_order_relaxed) : 0; }
+int menu_wall_climb() { return cheats_on() ? wall_climb.load(std::memory_order_relaxed) : 0; }
 int menu_link_speed() { return cheats_on() ? link_speeds[std::clamp(link_speed.load(std::memory_order_relaxed), 0, kLinkSpeeds - 1)] : 100; }
 /// The size the host draws the sun's cascades at (HOS_OPT_SHADOW_RES: 0 the game's 1600, 1 2200, 2 3072): the row's, or for
 /// Auto the one for the card's memory tier, the preset's (opts.budget) or else Auto's own for this PC (auto_choice): the
@@ -5898,6 +5903,10 @@ void cheat_press(int i, const bool* press, bool& changed) {
     if (press[7] && i == 12) cheat_action.store(OOT_RUPEE_ACTION + rupee_step);
     if ((press[3] || press[4] || press[7]) && i == 7) {   // (an On / Off as the first two: Left Off, Right On, confirm flips)
         free_camera.store(press[7] ? !free_camera.load() : press[4] ? 1 : 0);
+        changed = true;
+    }
+    if ((press[3] || press[4] || press[7]) && i == 13) {   // (Wall climb: the same On / Off)
+        wall_climb.store(press[7] ? !wall_climb.load() : press[4] ? 1 : 0);
         changed = true;
     }
     if (press[7] && i == 8) page = 3, teleport_follow = true, changed = true;
