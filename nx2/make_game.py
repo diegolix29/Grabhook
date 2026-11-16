@@ -2640,7 +2640,10 @@ def main(a=None):
             # Keep the last usable cache until the new package has been read and validated.
             staged_exefs = os.path.join(game, "exefs")
             try:
-                run(PY + [package_script(a.nup), a.nup, "--extract", game])
+                # (an update: the last unpack's unchanged files are hard-linked, not written again; it stays whole until
+                # the new one is checked, nup.reuse_unchanged)
+                reuse = ["--reuse", romfs] if os.path.isdir(romfs) else []
+                run(PY + [package_script(a.nup), a.nup, "--extract", game] + reuse)
                 check_modules(staged_exefs)
                 check_supported_build(staged_exefs)
                 if not os.path.isdir(os.path.join(game, "romfs")):

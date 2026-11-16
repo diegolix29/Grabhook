@@ -309,6 +309,32 @@ def gb(n):
     return "%.1f GB" % (n / (1 << 30)) if n >= 1 << 30 else "%d MB" % (n >> 20)
 
 
+NEEDED_BYTES = 45 << 30   # (the game data 24.4 GB, the shader caches ~8 GB, the game 0.4 GB, the build files ~5 GB at their peak)
+NEEDED_OVER_GAME_BYTES = 10 << 30   # (the game files already in the folder: the build files ~5 GB at their peak, the game 0.4 GB, headroom)
+
+
+def needed(folder, nup, picked):
+    """What a build into folder takes: less when the folder already holds the game files it builds from (an update from the
+    copy kept there, or the same .nup that copy was read from: make_game.py's .hookshot_romfs stamp), a whole first build's
+    otherwise. (a stamp that does not decode matches nothing: the whole first build's, never too little)"""
+    try:
+        if not (os.path.isdir(os.path.join(folder, ".hookshot_exefs")) and os.path.isdir(os.path.join(folder, "romfs"))):
+            return NEEDED_BYTES
+        if not picked:
+            return NEEDED_OVER_GAME_BYTES
+        if not nup or not os.path.isfile(nup):
+            return NEEDED_BYTES
+        stamp = "unpacked by this builder: %s %d" % (os.path.basename(nup), os.path.getsize(nup))
+        with open(os.path.join(folder, ".hookshot_romfs"), "rb") as f:
+            return NEEDED_OVER_GAME_BYTES if f.read().decode("utf-8").strip() == stamp else NEEDED_BYTES
+    except (OSError, UnicodeDecodeError):
+        return NEEDED_BYTES
+
+
+def needed_text(n):
+    return "Needs %d GB (the game files are already there)" % (n >> 30) if n < NEEDED_BYTES else "Needs %d GB" % (n >> 30)
+
+
 def free_space(path):
     try:
         root = os.path.splitdrive(os.path.abspath(path))[0] + "\\"

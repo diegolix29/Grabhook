@@ -18,6 +18,24 @@ namespace HookshotBuilder;
 public partial class MainWindow : Window
 {
     const long NeededBytes = 45L << 30;   // (measured 2026-11-09: the game data 24.4 GB, the shader caches ~8 GB, the game 0.4 GB, the build files ~5 GB at their peak; the rest headroom)
+    const long NeededOverGameBytes = 10L << 30;   // (the game files already in the folder: the build files ~5 GB at their peak, the game 0.4 GB, headroom)
+
+    /// What a build into folder takes: less when the folder already holds the game files it builds from (an update from the copy
+    /// kept there, or the same .nup that copy was read from: make_game.py's .hookshot_romfs stamp), a whole first build's otherwise.
+    /// (a stamp read with a replaced letter matches nothing: the whole first build's, never too little)
+    internal static long Needed(string folder, string? nup, bool picked)
+    {
+        try
+        {
+            if (!Directory.Exists(System.IO.Path.Combine(folder, ".hookshot_exefs")) || !Directory.Exists(System.IO.Path.Combine(folder, "romfs")))
+                return NeededBytes;
+            if (!picked) return NeededOverGameBytes;
+            if (nup == null || !File.Exists(nup)) return NeededBytes;
+            var stamp = $"unpacked by this builder: {System.IO.Path.GetFileName(nup)} {new FileInfo(nup).Length}";
+            return File.ReadAllText(System.IO.Path.Combine(folder, ".hookshot_romfs")).Trim() == stamp ? NeededOverGameBytes : NeededBytes;
+        }
+        catch (Exception) { return NeededBytes; }
+    }
     Language lang = Strings.Default();
     string T(S s) => (int)s < lang.Text.Length ? lang.Text[(int)s] : Strings.All[0].Text[(int)s];
 
@@ -798,14 +816,16 @@ public partial class MainWindow : Window
         {
             var root = System.IO.Path.GetPathRoot(System.IO.Path.GetFullPath(OutPath.Text))!;
             var free = new DriveInfo(root).AvailableFreeSpace;
-            SpaceBar.Value = Math.Min(1, NeededBytes / (double)Math.Max(1, free));
-            SpaceBar.Foreground = (Brush)FindResource(free >= NeededBytes ? "Go" : "Bad");
-            SpaceText.Text = $"Needs 45 GB · {root.TrimEnd('\\')} has {free >> 30} GB free";
-            SpaceText.Foreground = (Brush)FindResource(free >= NeededBytes ? "InkSoft" : "Bad");
+            var needed = Needed(OutPath.Text, romfs == null ? chosenNup : null, sourcePicked);
+            var what = needed < NeededBytes ? $"Needs {needed >> 30} GB (the game files are already there)" : $"Needs {needed >> 30} GB";
+            SpaceBar.Value = Math.Min(1, needed / (double)Math.Max(1, free));
+            SpaceBar.Foreground = (Brush)FindResource(free >= needed ? "Go" : "Bad");
+            SpaceText.Text = $"{what} · {root.TrimEnd('\\')} has {free >> 30} GB free";
+            SpaceText.Foreground = (Brush)FindResource(free >= needed ? "InkSoft" : "Bad");
         }
         catch (Exception)
         {
-            SpaceText.Text = "Needs 45 GB";
+            SpaceText.Text = $"Needs {NeededBytes >> 30} GB";
         }
         RefreshMode();
     }

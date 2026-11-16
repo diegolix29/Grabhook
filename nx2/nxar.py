@@ -267,11 +267,12 @@ def pick_title(nx, want):
     return t
 
 
-def extract(nx, want, out, only=None):
-    """Title want (None: the newest) to out/exefs and out/romfs, its modules made plain NSOs as nup.py does"""
+def extract(nx, want, out, only=None, reuse=None):
+    """Title want (None: the newest) to out/exefs and out/romfs, its modules made plain NSOs as nup.py does. reuse: the
+    last unpack's romfs, whose unchanged files are hard-linked (nup.reuse_unchanged)"""
     t = pick_title(nx, want)
     print("extracting title %d (v%d) to %s" % (t["index"], t["version"], out))
-    n, total = nup.extract(nx, t, out, only)
+    n, total = nup.extract(nx, t, out, only, reuse=reuse)
     print("done: %d files written, %.2f GB" % (n, total / 1e9))
     if only != "romfs":
         nup.plain_modules(nx, t, out)
@@ -283,6 +284,7 @@ def main(argv=None):
     ap.add_argument("--extract", metavar="DIR")
     ap.add_argument("--title", help="index, version or application id (default: the newest version)")
     ap.add_argument("--only", choices=("exefs", "romfs"))
+    ap.add_argument("--reuse", metavar="ROMFS", help="the last unpack's romfs: its unchanged files are hard-linked, not written")
     a = ap.parse_args(argv)
     nx = Nx(a.nx)
     with nx.f:
@@ -294,7 +296,7 @@ def main(argv=None):
                 t["index"], t["id"], t["version"], len(ex), ", ".join("%s %d" % (p, r[2]) for p, r in ex),
                 len(ro), sum(r[2] for _, r in ro) / 1e9))
         if a.extract:
-            extract(nx, a.title, a.extract, a.only)
+            extract(nx, a.title, a.extract, a.only, a.reuse)
 
 
 if __name__ == "__main__":

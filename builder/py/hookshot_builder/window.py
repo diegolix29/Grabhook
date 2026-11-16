@@ -21,7 +21,6 @@ from . import core, paths, setup_parts, strings, updater
 from .theme import (C, MONO, W_BOLD, W_MEDIUM, W_SEMIBOLD, Bar, Button, Card, Chip, Choice, PathEdit, Ring, Tick, argb, css,
                     faint, font, glow, heading, label, note, rounded, section, set_color, sub, tick_path)
 
-NEEDED_BYTES = 45 << 30   # (the game data 24.4 GB, the shader caches ~8 GB, the game 0.4 GB, the build files ~5 GB at their peak)
 
 STAGES = [("download", "", "Download the update"), ("read", "Read your game files", "Read the game files kept in the folder"),
           ("lift", "Translate the game to PC code", "Translate the game to PC code"), ("compile", "Compile", "Compile changed files"),
@@ -1245,12 +1244,13 @@ class Window(QWidget):
         self.build_button.setEnabled(self.source_ready() and len(self.out_path.text()) > 2)
         self.show_work()
         root, freeb = core.free_space(self.out_path.text())
+        need = core.needed(self.out_path.text(), None if self.romfs else self.chosen_nup, self.source_picked)
         if freeb is not None:
-            self.space_bar.set(min(1.0, NEEDED_BYTES / max(1, freeb)), "Go" if freeb >= NEEDED_BYTES else "Bad")
-            self.space_text.setText("Needs 45 GB · %s has %d GB free" % (root.rstrip("\\"), freeb >> 30))
-            set_color(self.space_text, "InkSoft" if freeb >= NEEDED_BYTES else "Bad")
+            self.space_bar.set(min(1.0, need / max(1, freeb)), "Go" if freeb >= need else "Bad")
+            self.space_text.setText("%s · %s has %d GB free" % (core.needed_text(need), root.rstrip("\\"), freeb >> 30))
+            set_color(self.space_text, "InkSoft" if freeb >= need else "Bad")
         else:
-            self.space_text.setText("Needs 45 GB")
+            self.space_text.setText(core.needed_text(need))
         self.refresh_mode()
 
     def dragEnterEvent(self, e):

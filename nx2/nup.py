@@ -590,8 +590,54 @@ def out_of_space(error, dst, part, rel, size):
         part, rel, size, free, ", " + kind if kind else ""))
 
 
-def extract(nup, t, out, only=None, quiet=False):
-    total = n = written = 0
+def file_digest(path):
+    """A file's first four bytes and its SHA-256, read once"""
+    with open(path, "rb") as f:
+        prefix = f.read(4)
+        digest = hashlib.sha256(prefix)
+        for block in iter(lambda: f.read(1 << 20), b""):
+            digest.update(block)
+    return prefix, digest.digest()
+
+
+class NoHardLinks(Exception):
+    """The extraction's folder cannot hard-link the last unpack's files"""
+
+
+def reuse_unchanged(old_romfs, rel, dst, size, expected):
+    """An update's romfs member taken from the last unpack's romfs: hard-linked into the extraction when that file has the
+    member's size and the hash the package lists for it, so only what the update changed is written (a new game version
+    used to take the whole romfs again, 40 GB and more, beside the copy it replaces). The old file is never written to: a
+    member that differs is unlinked from the extraction and written afresh, the old copy keeping its data. Returns the
+    file's first four bytes when it was taken, None when it was not, and raises NoHardLinks when no hard link can be made
+    here (another drive, or a file system without them)."""
+    old = os.path.join(old_romfs, *package_parts(rel))
+    try:
+        info = os.lstat(old)
+    except OSError:
+        return None
+    if not stat.S_ISREG(info.st_mode) or is_link(info) or info.st_size != size:
+        return None
+    try:
+        os.link(old, dst)
+    except OSError as error:
+        raise NoHardLinks(error) from error
+    try:
+        prefix, digest = file_digest(dst)
+    except BaseException:
+        os.unlink(dst)
+        raise
+    if digest == expected:
+        return prefix
+    os.unlink(dst)
+    return None
+
+
+def extract(nup, t, out, only=None, quiet=False, reuse=None):
+    """Title t's exefs and romfs (or only one) to out. reuse: the romfs of the last unpack, whose unchanged files are
+    hard-linked rather than written again (reuse_unchanged)"""
+    total = n = written = kept = kept_bytes = 0
+    old_romfs = long_path(os.path.realpath(os.path.abspath(reuse))) if reuse and os.path.isdir(reuse) else None
     digests = {}
     details = getattr(nup, "file_details", ())
     if only != "exefs" and details:
@@ -624,6 +670,22 @@ def extract(nup, t, out, only=None, quiet=False):
                 info = None
             if info is not None and is_link(info):
                 raise SystemExit("extraction path is a link or reparse point: %s" % dst)
+            known = digests.get(id(r)) if part == "romfs" and old_romfs else None
+            if info is None and known is not None:   # (a member without a listed hash is written: a size alone proves nothing)
+                try:
+                    prefix = reuse_unchanged(old_romfs, rel, dst, r[2], known)
+                except NoHardLinks as error:
+                    old_romfs = None   # (no hard links here: everything is written, as before)
+                    if not quiet:
+                        print("  the last unpack's files cannot be reused here (%s): the whole romfs is written" % error,
+                              flush=True)
+                else:
+                    if prefix is not None:
+                        if checked and not zstd_start(prefix):
+                            damaged.append(rel)
+                        kept += 1
+                        kept_bytes += r[2]
+                        continue
             # (an interrupted member is shorter than its size: written again)
             if info is not None and stat.S_ISREG(info.st_mode) and info.st_size == r[2]:
                 if checked:
@@ -668,6 +730,8 @@ def extract(nup, t, out, only=None, quiet=False):
             with open(heads + ".part", "w", encoding="utf-8", newline="\n") as f:
                 f.write(HEADS_MAGIC + "\n" + "".join(rel + "\n" for rel in damaged))
             os.replace(heads + ".part", heads)
+    if kept and not quiet:
+        print("kept %d unchanged files (%.2f GB) from the last unpack" % (kept, kept_bytes / 1e9), flush=True)
     return n, total
 
 
@@ -835,6 +899,7 @@ def main():
     ap.add_argument("--verify", action="store_true", help="read-only hashes/extents and expected game .zs headers; all titles unless --title")
     ap.add_argument("--title", help="index, version or title id (extract default: newest; verify default: all)")
     ap.add_argument("--only", choices=("exefs", "romfs"))
+    ap.add_argument("--reuse", metavar="ROMFS", help="the last unpack's romfs: its unchanged files are hard-linked, not written")
     a = ap.parse_args()
     if a.verify and a.extract:
         ap.error("--verify does not extract; run extraction separately")
@@ -873,7 +938,7 @@ def main():
             folder = parent
         free = shutil.disk_usage(folder).free
         print("extracting title %d (v%d) to %s (%.0f GB free)" % (t["index"], t["version"], a.extract, free / 1e9))
-        n, total = extract(nup, t, a.extract, a.only)
+        n, total = extract(nup, t, a.extract, a.only, reuse=a.reuse)
         print("done: %d files written, %.2f GB" % (n, total / 1e9))
         if a.only != "romfs":
             plain_modules(nup, t, a.extract)

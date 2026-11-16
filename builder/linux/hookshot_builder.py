@@ -357,6 +357,29 @@ def add_to_menu(folder):
                 % (desktop_exec(os.path.join(folder, "hookshot")), folder, icon, APP_ID))
 
 
+NEEDED_GB = 45   # (a first build: the game data 24.4 GB, the shader caches ~8 GB, the game 0.4 GB, the build files ~5 GB at their peak)
+NEEDED_OVER_GAME_GB = 10   # (the game files already in the folder: the build files ~5 GB at their peak, the game 0.4 GB, headroom)
+
+
+def needed_gb(folder, nup, picked):
+    """What a build into folder takes: less when the folder already holds the game files it builds from (an update from the
+    copy kept there, or the same .nup that copy was read from: make_game.py's .hookshot_romfs stamp), a whole first build's
+    otherwise. (a stamp that does not decode matches nothing: the whole first build's, never too little)"""
+    try:
+        if not folder or not (os.path.isdir(os.path.join(folder, ".hookshot_exefs")) and os.path.isdir(os.path.join(folder, "romfs"))):
+            return NEEDED_GB
+        if not picked:
+            return NEEDED_OVER_GAME_GB
+        nup = os.path.expanduser(nup or "")
+        if not nup or not os.path.isfile(nup):
+            return NEEDED_GB
+        stamp = "unpacked by this builder: %s %d" % (os.path.basename(nup), os.path.getsize(nup))
+        with open(os.path.join(folder, ".hookshot_romfs"), "rb") as f:
+            return NEEDED_OVER_GAME_GB if f.read().decode("utf-8").strip() == stamp else NEEDED_GB
+    except (OSError, UnicodeDecodeError):
+        return NEEDED_GB
+
+
 def free_gb(path):
     path = os.path.expanduser(path or "")   # (the field takes ~/Games/Hookshot, as build() and apply_mode() read it)
     while path and not os.path.exists(path):
@@ -1160,7 +1183,7 @@ class Builder(tk.Tk):
         if p:
             var.set(p)
             self.source_picked = True
-            self.apply_mode()
+            self.update_space()   # (the need follows the source: the same .nup as the folder's copy needs less; then apply_mode)
             self.check_version()
 
     def pick_dir(self, var):
@@ -1169,17 +1192,20 @@ class Builder(tk.Tk):
             var.set(p)
             if var is self.exefs:
                 self.source_picked = True
-                self.apply_mode()
+                self.update_space()
                 self.check_version()
 
     def update_space(self):
         gb = free_gb(self.out.get())
-        self.space_text.set("Needs 45 GB · %.0f GB free there" % gb if gb is not None else "Needs 45 GB")
-        bar = getattr(self, "space_bar", None)   # (as on Windows: the 45 GB's share of what is free, green when it fits)
+        nup = self.nup.get() if self.kind.get() == "nup" else None
+        need = needed_gb(os.path.expanduser(self.out.get().strip()), nup, self.source_picked)
+        what = "Needs %d GB (the game files are already there)" % need if need < NEEDED_GB else "Needs %d GB" % need
+        self.space_text.set("%s · %.0f GB free there" % (what, gb) if gb is not None else what)
+        bar = getattr(self, "space_bar", None)   # (as on Windows: the need's share of what is free, green when it fits)
         try:
             if bar is not None and bar.winfo_exists():
-                bar.configure(value=min(1.0, 45 / max(gb, 0.1)) if gb is not None else 0,
-                              style="Go.Horizontal.TProgressbar" if gb is None or gb >= 45 else "Bad.Horizontal.TProgressbar")
+                bar.configure(value=min(1.0, need / max(gb, 0.1)) if gb is not None else 0,
+                              style="Go.Horizontal.TProgressbar" if gb is None or gb >= need else "Bad.Horizontal.TProgressbar")
         except tk.TclError:
             pass
         self.apply_mode()

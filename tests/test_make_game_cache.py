@@ -78,6 +78,7 @@ class NupCacheTests(unittest.TestCase):
         (save / "sentinel.txt").write_bytes(b"authored save sentinel")
         (self.out / "hookshot_options.ini").write_bytes(b"authored options sentinel")
         self.extractions = []
+        self.commands = []
         self.output = ""
 
     def assert_owned_fixture(self):
@@ -102,6 +103,7 @@ class NupCacheTests(unittest.TestCase):
                 target = Path(cmd[cmd.index("--extract") + 1]).resolve()
                 self.assertTrue(target.is_relative_to(self.root))
                 self.extractions.append(nup)
+                self.commands.append(list(cmd))
                 (target / "exefs").mkdir(parents=True)
                 (target / "exefs" / "main").write_bytes(module_bytes(supported=supported))
                 if failure:
@@ -224,6 +226,14 @@ class NupCacheTests(unittest.TestCase):
         self.assertEqual(self.marker.read_text(), self.stamp(self.new_nup) + "\n")
         self.assertEqual((self.out / "user/save/sentinel.txt").read_bytes(), b"authored save sentinel")
         self.assertEqual((self.out / "hookshot_options.ini").read_bytes(), b"authored options sentinel")
+
+    def test_changed_source_hands_the_last_romfs_to_the_extraction(self):
+        # (an update's unchanged files are hard-linked from it, not written again: nup.reuse_unchanged)
+        with self.assertRaises(Prepared):
+            self.run_to_lift(self.new_nup)
+        [cmd] = self.commands
+        self.assertIn("--reuse", cmd)
+        self.assertEqual(Path(cmd[cmd.index("--reuse") + 1]).resolve(), (self.out / "romfs").resolve())
 
     def test_same_source_reuses_the_cache(self):
         before = self.cache()
