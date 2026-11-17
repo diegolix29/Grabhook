@@ -173,6 +173,14 @@ bool serial_builds_on() { return false; }
 #include "precompile_save.h"
 thread_local precompile_save::Outcome pcache_save_outcome;
 using SaveOutcome = precompile_save::Outcome;
+// (vk_draw.cpp: the gate for a save in play, RX_VK_PCACHE_PLAY_SAVE; here every save goes through, as with its default 2)
+std::atomic<std::int64_t> pcache_saved_at_s{-1};
+constexpr std::uint64_t kPlaySaveSpareMB = 4096;
+int pcache_play_save_mode() { return 2; }
+std::uint64_t pcache_available_bytes() { return UINT64_MAX; }
+std::uint64_t pcache_file_bytes() { return 0; }
+int pcache_play_save_gate(int, std::uint64_t, std::uint64_t, std::int64_t) { return 0; }
+static bool env_on(const char*) { return false; }   // (gpu/vk/compat/hookshot_env.h: RX_VK_PCACHE_SAVE_ALWAYS unset)
 #include "pipeline_cache_save.inc"
 #ifdef CACHE_VECTOR_BASELINE
 #undef fwrite

@@ -13,7 +13,7 @@ struct HosThread {
     int vc_boost = 0;
     int vc_kick = 0;
     int vc_prio_over = 0;
-    int64_t vc_since = 0, vc_cap_until = 0, vc_free_until = 0;
+    int64_t vc_since = 0, vc_took = 0, vc_cap_until = 0, vc_free_until = 0;
     int vc_cv = 0;
     int acquires = 0, boost_at_acquire = -1;
     struct Ctx *run_ctx = nullptr;

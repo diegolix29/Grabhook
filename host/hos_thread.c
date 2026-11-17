@@ -46,7 +46,7 @@ struct HosThread {
     int vc_boost;   /* (priority steps better while it has the core it took back after the replay: hos_vcore_back_first) */
     volatile int vc_kick;
     int vc_prio_over;   /* (hookshot, HOS_VC_PRIO) the priority the virtual cores schedule it at, 0: its own */
-    int64_t vc_since;
+    int64_t vc_since, vc_took;   /* (when it began to wait for a core; when it took the one it holds) */
     int bg_kind; int64_t bg_since;   /* (Hookshot, sprint 5: HOS_BG_THROTTLE, hos_vcore_checkpoint) */
     /* (HOS_CORE_COUNT, TICK-062 A10) calls that ask for the core number (HLE, svc 0x10), waits for a virtual core and their time */
     int64_t cc_hle, cc_svc, cc_vcw, cc_vcw_ns;
@@ -322,6 +322,17 @@ static void log_flush(void) {}
 
 void hos_log_flush(void) { log_flush(); }
 
+/* HOS_LOG_QPC=1: every log line ends with " @qpc <ticks>", the QueryPerformanceCounter value when it was logged, the clock
+   PresentMon's TimeInQPC column counts in: a line then falls on the frames of a capture. Off by default, the lines as before */
+static long long log_qpc_now(void) {
+    static int on = -1;
+    if (on < 0) on = env_on("HOS_LOG_QPC");
+    if (!on) return -1;
+    LARGE_INTEGER q;
+    QueryPerformanceCounter(&q);
+    return (long long)q.QuadPart;
+}
+
 /* (hookshot) A line's level as the log writes it: none for info, so the lines most of the log is stay as they were; "[trace] "
    after the thread's tag for the rest, which the launcher's log reads to show info and above unless asked for more */
 static const char *log_level_tag(int level) {
@@ -335,13 +346,17 @@ static const char *log_level_tag(int level) {
 }
 
 static void hos_vlog(int level, const char *fmt, va_list ap) {
-    char buf[1024], line[1100];
+    char buf[1024], line[1152];   /* (room for the name, the level, the message and the stamp) */
+    const long long qpc = log_qpc_now();
     vsnprintf(buf, sizeof buf, fmt, ap);
     if (!strncmp(buf, HOS_REPORT_DEVICE_LOST_PREFIX, sizeof HOS_REPORT_DEVICE_LOST_PREFIX - 1))
         hos_crash_record_fatal(NULL, "device lost");
     else if (!strncmp(buf, HOS_REPORT_FATAL_PREFIX, sizeof HOS_REPORT_FATAL_PREFIX - 1))
         hos_crash_record_fatal(NULL, strstr(buf, "VK_ERROR_DEVICE_LOST") ? "device lost" : "Vulkan fatal");
-    snprintf(line, sizeof line, "[hos %s] %s%s\n", cur ? cur->name : "host", log_level_tag(level), buf);
+    if (qpc >= 0)
+        snprintf(line, sizeof line, "[hos %s] %s%s @qpc %lld\n", cur ? cur->name : "host", log_level_tag(level), buf, qpc);
+    else
+        snprintf(line, sizeof line, "[hos %s] %s%s\n", cur ? cur->name : "host", log_level_tag(level), buf);
     extern volatile int hos_control_on;   /* (control.c: log lines for its subscribers) */
     if (hos_control_on) {
         void hos_control_log(const char *line);
@@ -1848,6 +1863,7 @@ static void vc_take(HosThread *t, int c) {
     t->vc_last = c + 1;
     t->vc_kick = 0;
     t->vc_starved = 0;
+    t->vc_took = hos_now_ns();
     /* (hookshot, vc_bg_cap) a frame thread took a core past the cap: the worst background holder not left alone gives
        its own up at its next checkpoint (vc_kick 3: vc_yield lets it go even with nobody waiting for that core) */
     const int cap = vc_bg_cap();
@@ -1969,6 +1985,31 @@ static int64_t vc_env_ns(const char *name, int64_t us) {
     const char *e = getenv(name);
     return (e ? atoll(e) : us) * 1000;
 }
+/* Where a core's holder is now, for the escape line: " at <module>+<offset>" of its host thread's instruction pointer
+   (Hookshot.exe's link map names the lifted function, f_<guest address>, or the host function around it), sampled with
+   the thread stopped for the one GetThreadContext call. Nothing is called while it is stopped: a lock it holds (the heap's,
+   the loader's) cannot be waited for here */
+static void vc_where(HosThread *h, char *out, size_t cap) {
+    out[0] = 0;
+#if defined(_WIN32) && !defined(__EMSCRIPTEN__)
+    if (!h->handle || SuspendThread(h->handle) == (DWORD)-1) return;
+    CONTEXT ctx;
+    memset(&ctx, 0, sizeof ctx);
+    ctx.ContextFlags = CONTEXT_CONTROL;
+    const BOOL got = GetThreadContext(h->handle, &ctx);
+    ResumeThread(h->handle);
+    if (!got) return;
+    HMODULE mod = NULL;
+    char path[MAX_PATH] = "?";
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCSTR)(uintptr_t)ctx.Rip, &mod))
+        GetModuleFileNameA(mod, path, sizeof path);
+    const char *base = strrchr(path, '\\');
+    snprintf(out, cap, " at %s+%#llx", base ? base + 1 : path, (unsigned long long)(ctx.Rip - (uintptr_t)mod));
+#else
+    (void)h, (void)cap;
+#endif
+}
 static void vc_acquire(HosThread *t) {
     static int64_t esc_better = -1, esc_eq, slice, spin_ns, starve;
     int spun = 0;
@@ -2067,15 +2108,23 @@ static void vc_acquire(HosThread *t) {
             t->vc_boost = 0;   /* (no core to keep a place on) */
             vc_st.escapes++;
             static int logged;
-            if (logged < 40) {
+            if (logged < 400) {   /* (40 were all spent in a zone's load: the escapes of steady play went unlogged) */
                 logged++;
-                char who[256] = "";
+                /* (each holder with how long it has held its core: a holder that took it after this wait began handed
+                   it on in between; one that has held it all along ran that long without an nn::os call, an SVC or a
+                   loop poll, or sat blocked in host code with its core: where it is then, vc_where) */
+                char who[480] = "";
                 int len = 0;
-                for (int k = 0; k < vc_cores() && len < 200; k++)
-                    if (m >> k & 1)
-                        len += snprintf(who + len, sizeof who - len, " core %d: %s (%d)%s;", k,
-                                        vc_owner[k] ? vc_owner[k]->name : "-", vc_owner[k] ? vc_owner[k]->priority : 0,
-                                        vc_owner[k] && vc_owner[k]->vc_kick ? " asked" : "");
+                const int64_t now = hos_now_ns();
+                for (int k = 0; k < vc_cores() && len < 360; k++)
+                    if (m >> k & 1) {
+                        HosThread *h = vc_owner[k];
+                        char at[96] = "";
+                        if (h && now - h->vc_took > esc_eq / 2) vc_where(h, at, sizeof at);
+                        len += snprintf(who + len, sizeof who - len, " core %d: %s (%d)%s, held %.0f ms%s;", k,
+                                        h ? h->name : "-", h ? h->priority : 0, h && h->vc_kick ? " asked" : "",
+                                        h ? (now - h->vc_took) / 1e6 : 0.0, at);
+                    }
                 hos_log("vcores: %s (priority %d) ran without a core after %.1f ms:%s", t->name, t->priority, waited / 1e6, who);
             }
             break;

@@ -12467,13 +12467,74 @@ void pipeline_cache_between_builds() {
     struct Done { ~Done() { pcache_save_between = false; } } done;
     pipeline_cache_save(false);
 }
+// A save in play, by RX_VK_PCACHE_PLAY_SAVE: 2 (the default) every time it is asked, as before; 1 only with room for it and
+// not more often than every kPlaySaveMinS, on a thread in Windows' background mode; 0 never (a forced save, at exit, the
+// prepare or Restart now, writes what play built). Measured where the heap's cold pages are taken out of the working set
+// (HL_MEM_COLD, off by default here): a 1.27 GB cache saved 7 times in play (RTX 5070, 31 GB of RAM, 28 GB of private
+// commit), and after two of the saves the game stopped for 3.5 to 14.2 s while 200 to 270 MB of those heap pages came back
+// from the page file, pushed out of RAM by the saves' new file pages. Room: the physical memory available is at least twice
+// the cache plus kPlaySaveSpareMB. 0 save, 1 put off for room, 2 put off for the interval, 3 never in play
+constexpr uint64_t kPlaySaveSpareMB = 4096;
+constexpr int64_t kPlaySaveMinS = 300;
+int pcache_play_save_gate(int mode, uint64_t avail_bytes, uint64_t cache_bytes, int64_t since_last_s) {
+    if (mode >= 2) return 0;
+    if (mode <= 0) return 3;
+    if (avail_bytes < 2 * cache_bytes + (kPlaySaveSpareMB << 20)) return 1;
+    if (since_last_s >= 0 && since_last_s < kPlaySaveMinS) return 2;
+    return 0;
+}
+std::atomic<int64_t> pcache_saved_at_s{-1};   // (steady clock seconds of the last save in play; -1: none yet)
+int pcache_play_save_mode() {
+    static const int mode = [] {
+        const char* e = getenv("RX_VK_PCACHE_PLAY_SAVE");
+        return e && *e ? atoi(e) : 2;
+    }();
+    return mode;
+}
+uint64_t pcache_available_bytes() {
+#ifdef _WIN32
+    MEMORYSTATUSEX m{};
+    m.dwLength = sizeof m;
+    return GlobalMemoryStatusEx(&m) ? (uint64_t)m.ullAvailPhys : UINT64_MAX;
+#else
+    return UINT64_MAX;
+#endif
+}
+uint64_t pcache_file_bytes() {   // (the cache's size on disk: what the next save writes again, about)
+#ifdef _WIN32
+    WIN32_FILE_ATTRIBUTE_DATA fa{};
+    if (GetFileAttributesExA(pcache_path.c_str(), GetFileExInfoStandard, &fa)) return (uint64_t)fa.nFileSizeHigh << 32 | fa.nFileSizeLow;
+#endif
+    return 0;
+}
 void pipeline_cache_save(bool force) {
     using Outcome = precompile_save::Outcome;
     pcache_save_outcome = {};
     const bool between = pcache_save_between;
     if (!pcache) pcache_save_outcome.what = Outcome::kNoCache;
     else if (pcache_no_save) pcache_save_outcome.what = Outcome::kOff;
-    if (!pcache || pcache_no_save || (!force && !between && pcache_built_since_save < 32)) return;
+    // (RX_VK_PCACHE_SAVE_ALWAYS=1, for measurements: every save asked in play goes ahead to the gate even with fewer than 32
+    // pipelines built since the last one, as play with many new pipelines would have it)
+    static const bool always = env_on("RX_VK_PCACHE_SAVE_ALWAYS");
+    if (!pcache || pcache_no_save || (!force && !between && !always && pcache_built_since_save < 32)) return;
+    if (!force && !between && pcache_play_save_mode() < 2) {   // (a save asked in play: RX_VK_PCACHE_PLAY_SAVE's gate)
+        const int64_t now_s =
+            std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        const int64_t last = pcache_saved_at_s.load();
+        const uint64_t avail = pcache_available_bytes(), size = pcache_file_bytes();
+        const int gate = pcache_play_save_gate(pcache_play_save_mode(), avail, size, last < 0 ? -1 : now_s - last);
+        if (gate) {
+            static int64_t told;
+            if (gate != 2 && (++told <= 4 || told % 32 == 0))
+                logf("vk: pipeline cache save put off in play (%s; %lld pipelines owed): written at exit or later",
+                     gate == 3 ? "RX_VK_PCACHE_PLAY_SAVE=0" : "too little free memory for it", (long long)pcache_built_since_save.load());
+            if (gate == 1 && (told <= 4 || told % 32 == 0))
+                logf("vk:   (%llu MB available, %llu MB of cache: a save in play wants twice the cache and %llu MB more)",
+                     (unsigned long long)(avail >> 20), (unsigned long long)(size >> 20), (unsigned long long)kPlaySaveSpareMB);
+            return;
+        }
+        pcache_saved_at_s = now_s;
+    }
     const int64_t built = pcache_built_since_save.exchange(0);
     // (on a thread of its own unless forced, at exit: ~100 MB fetched and written took the replay thread 100+ ms at
     // each scene change; the cache is internally synchronized, pipelines go on being built meanwhile)
@@ -12490,6 +12551,12 @@ void pipeline_cache_save(bool force) {
     }
     auto save = [force, between, built] {
         struct Done { ~Done() { busy = false; } } done;
+#ifdef _WIN32
+        // (RX_VK_PCACHE_PLAY_SAVE=1: a save in play runs in Windows' background mode, on its own thread: its disk writes at
+        // low I/O priority and the pages it touches, the file's among them, at low memory priority, so that RAM gives them up
+        // before the game's)
+        if (!force && !between && pcache_play_save_mode() == 1) SetThreadPriority(GetCurrentThread(), THREAD_MODE_BACKGROUND_BEGIN);
+#endif
         // (Intel: no build under way while the caches' data is fetched, PcacheFetch, the lock held around each fetch alone. A
         // forced save waits for the builds; the background one polls, and is put off when builds ran throughout; after
         // kFetchPutOffs of those in a row it queues for kFetchQueueMs, so a stretch of back-to-back builds cannot put it off for good.

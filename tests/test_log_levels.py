@@ -54,6 +54,7 @@ struct HosThread { const char* name; };
 HosThread* cur;
 volatile int hos_control_on;
 void hos_control_log(const char*) {}
+static long long log_qpc_now() { return -1; }   // (HOS_LOG_QPC unset: no stamp)
 std::string queued;
 static int log_queue(const char* line) { queued = line; return 1; }
 std::string fatal_reason;

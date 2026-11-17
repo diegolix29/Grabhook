@@ -50,6 +50,7 @@
 
 #define HL_MEM_COLD_DEFAULT 0   /* (off by default here: =1 on) */
 #define HL_MEM_COLD_HEAPS_DEFAULT 0   /* (off by default here: =1 on) */
+#define HL_MEM_COLD_LISTED_DEFAULT 0   /* (off by default here: =1 on) */
 #define COLD_UNIT_SHIFT 16                  /* (64 KB units: the commit-on-touch granule, 16 pages) */
 #define COLD_UNIT_MASK 0xFFFFULL
 #define COLD_PASS_MS 500
@@ -65,7 +66,7 @@
 #define COLD_MAX_EXCLUDED 20480
 
 static volatile LONG cold_on;
-static int heaps_on;
+static int heaps_on, heaps_listed_on;
 static uint32_t cold_flags[8];
 static int cold_nflags;
 static int64_t cold_age_ns;
@@ -82,6 +83,9 @@ void hl_mem_unimported(uint64_t lo, uint64_t hi) {
 }
 
 typedef struct { void *va; ULONG_PTR attr; } ColdWs;   /* PSAPI_WORKING_SET_EX_INFORMATION (bit 0: valid) */
+static int64_t cold_unlocks, cold_queries;   /* (VirtualUnlock and VirtualQuery calls: a slow pass's line) */
+static int64_t cold_max_ws, cold_max_unlock, cold_max_query;   /* (the longest call of each kind in the pass, ns) */
+static uint64_t cold_max_query_at, cold_max_query_size;        /* (and that VirtualQuery's address and region) */
 typedef BOOL(WINAPI *ColdQueryFn)(HANDLE, PVOID, DWORD);
 static ColdQueryFn cold_query;
 
@@ -92,7 +96,10 @@ static void cold_slice(int kind, uint64_t a, uint64_t b) {
     ColdWs info[MAXP], again[MAXP];
     const int m = (int)((b - a) >> 12);
     for (int k = 0; k < m; k++) info[k].va = GP(a + ((uint64_t)k << 12)), info[k].attr = 0;
-    if (!cold_query(GetCurrentProcess(), info, (DWORD)(m * sizeof(ColdWs)))) return;
+    const int64_t q0 = hos_now_ns();
+    const BOOL got = cold_query(GetCurrentProcess(), info, (DWORD)(m * sizeof(ColdWs)));
+    if (hos_now_ns() - q0 > cold_max_ws) cold_max_ws = hos_now_ns() - q0;
+    if (!got) return;
     int took[MAXP >> 4][2], ntook = 0;   /* (first page, end page of each unit taken out) */
     for (int k = 0; k < m;) {
         const uint64_t unit = (a + ((uint64_t)k << 12)) >> COLD_UNIT_SHIFT;
@@ -105,7 +112,10 @@ static void cold_slice(int kind, uint64_t a, uint64_t b) {
                 if (!(info[j].attr & 1)) { j++; continue; }
                 int r = j;
                 while (r < e && (info[r].attr & 1)) r++;
+                const int64_t u0 = hos_now_ns();
                 VirtualUnlock(info[j].va, (SIZE_T)(r - j) << 12);   /* (fails with ERROR_NOT_LOCKED, and trims: by design) */
+                if (hos_now_ns() - u0 > cold_max_unlock) cold_max_unlock = hos_now_ns() - u0;
+                cold_unlocks++;
                 j = r;
             }
             took[ntook][0] = k, took[ntook][1] = e, ntook++;
@@ -195,6 +205,60 @@ static int heaps_excluded(void) {
     return m;
 }
 static int64_t heap_sweeps;
+
+/* (HL_MEM_COLD_LISTED=1, the default) The heaps' ranges from the OS layer's own books: the heap, then the address regions
+   above it, ascending, adjacent ones merged; their pages are looked at with QueryWorkingSetEx alone, a page not committed
+   reads as not resident. The walk before it found the committed pages with VirtualQuery, and one VirtualQuery over a large
+   lazily committed range walks its page tables to find where the range ends, with the process's address space lock held:
+   on the main PC, passes of 300-430 ms with ~205 queries, and in each of them a game thread committing memory
+   (NtAllocateVirtualMemory: AllocateMemoryPages, a first touch) sat that long with its virtual core, and every thread
+   waiting for that core ran without one after 250 ms: the 165-317 ms frames of steady play (temple of time, 3 runs of 3) */
+#define COLD_MAX_LISTED 32768
+#define COLD_LIST_SCAN_PAGES (128 * 1024)   /* (512 MB looked at a pass: pages not committed cost a look too) */
+static uint64_t listed[COLD_MAX_LISTED][2];
+static int heaps_listed(void) {
+    int n = 0;
+    if (hos_heap_size) listed[n][0] = HOS_HEAP_BASE, listed[n][1] = HOS_HEAP_BASE + hos_heap_size, n++;
+    n += hos_regions_above(HOS_HEAP_BASE, listed + n, COLD_MAX_LISTED - n);
+    int m = 0;   /* (whole units, merged) */
+    for (int k = 0; k < n; k++) {
+        const uint64_t lo = listed[k][0] & ~COLD_UNIT_MASK, hi = (listed[k][1] + COLD_UNIT_MASK) & ~COLD_UNIT_MASK;
+        if (hi > HOS_GUEST_SPACE || hi <= lo) continue;
+        if (m && lo <= listed[m - 1][1]) {
+            if (hi > listed[m - 1][1]) listed[m - 1][1] = hi;
+        } else listed[m][0] = lo, listed[m][1] = hi, m++;
+    }
+    return m;
+}
+static void heaps_pass_listed(void) {
+    static uint64_t at = HOS_HEAP_BASE;   /* (unit aligned) */
+    const int ne = heaps_excluded(), nl = heaps_listed();
+    hl_mem_cold_pass(HL_MEM_COLD_HEAPS);
+    int e = 0, l = 0;
+    while (l < nl && listed[l][1] <= at) l++;
+    int64_t scanned = 0;
+    for (; scanned < COLD_LIST_SCAN_PAGES; l++) {
+        if (l >= nl) {   /* (a sweep done: the next pass starts again at the bottom) */
+            at = HOS_HEAP_BASE;
+            heap_sweeps++;
+            break;
+        }
+        const uint64_t lo = listed[l][0] > at ? listed[l][0] : at;
+        uint64_t hi = listed[l][1];
+        const uint64_t room = (uint64_t)(COLD_LIST_SCAN_PAGES - scanned) << 12;
+        if (hi - lo > room) hi = lo + room;   /* (room is whole units: the rest of the range next pass) */
+        for (uint64_t a = lo; a < hi;) {
+            while (e < ne && excluded[e][1] <= a) e++;
+            if (e < ne && excluded[e][0] <= a) { a = excluded[e][1]; continue; }
+            const uint64_t b = e < ne && excluded[e][0] < hi ? excluded[e][0] : hi;
+            scanned += cold_range(HL_MEM_COLD_HEAPS, a, b);
+            a = b;
+        }
+        at = hi;
+        if (hi < listed[l][1]) break;   /* (the pass's looks are spent inside this range) */
+    }
+}
+
 static void heaps_pass(void) {
     static uint64_t at = HOS_HEAP_BASE;   /* (unit aligned) */
     const int ne = heaps_excluded();
@@ -208,7 +272,12 @@ static void heaps_pass(void) {
             break;
         }
         MEMORY_BASIC_INFORMATION mbi;
-        if (!VirtualQuery(GP(at), &mbi, sizeof mbi)) { at = HOS_GUEST_SPACE; continue; }
+        cold_queries++;
+        const int64_t v0 = hos_now_ns();
+        const SIZE_T vq = VirtualQuery(GP(at), &mbi, sizeof mbi);
+        if (hos_now_ns() - v0 > cold_max_query)
+            cold_max_query = hos_now_ns() - v0, cold_max_query_at = at, cold_max_query_size = vq ? mbi.RegionSize : 0;
+        if (!vq) { at = HOS_GUEST_SPACE; continue; }
         uint64_t end = (uint64_t)((uint8_t *)mbi.BaseAddress - (uint8_t *)GP(0)) + mbi.RegionSize;
         if (end > HOS_GUEST_SPACE) end = HOS_GUEST_SPACE;
         uint64_t lo = at;
@@ -240,16 +309,28 @@ static DWORD WINAPI cold_main(void *unused) {
         Sleep(COLD_PASS_MS);
         if (hos_pool_trap_active()) continue;
         const int64_t t0 = hos_now_ns();
+        const int64_t unlocks0 = cold_unlocks, queries0 = cold_queries;
+        cold_max_ws = cold_max_unlock = cold_max_query = 0;
         pools_pass();
-        const int64_t t1 = hos_now_ns();
+        const int64_t t1 = hos_now_ns(), unlocks1 = cold_unlocks;
         if (heaps_on) {
             const uint64_t back = hl_mem_cold_back_pages(HL_MEM_COLD_POOLS) + hl_mem_cold_back_pages(HL_MEM_COLD_HEAPS);
             if (++passes > 2 && back - back_before[1] >= COLD_QUIET_PAGES) quiet_left = COLD_QUIET_PASSES;
             back_before[1] = back_before[0], back_before[0] = back;
             if (quiet_left > 0) quiet_left--, quiet_passes++, hl_mem_cold_pass(HL_MEM_COLD_HEAPS);   /* (holds count on) */
+            else if (heaps_listed_on) heaps_pass_listed();
             else heaps_pass();
         }
         const int64_t t2 = hos_now_ns();
+        /* (a pass of 100 ms or more, alone, with its calls: such passes came with the 250 ms frames of the v0.4.0
+           benchmark, the game's Resource Memory thread holding its core meanwhile) */
+        if (t2 - t0 >= 100000000LL)
+            hos_log("hl mem: a slow pass: pools %.1f ms (%lld unlocks), heaps %.1f ms (%lld unlocks, %lld queries); the longest "
+                    "calls: working-set query %.1f ms, unlock %.1f ms, VirtualQuery %.1f ms (at %#llx, a region of %llu MB)",
+                    (t1 - t0) / 1e6, (long long)(unlocks1 - unlocks0), (t2 - t1) / 1e6,
+                    (long long)(cold_unlocks - unlocks1), (long long)(cold_queries - queries0), cold_max_ws / 1e6,
+                    cold_max_unlock / 1e6, cold_max_query / 1e6, (unsigned long long)cold_max_query_at,
+                    (unsigned long long)(cold_max_query_size >> 20));
         if ((t1 - t0) / 1e6 > worst_ms[0]) worst_ms[0] = (t1 - t0) / 1e6;
         if ((t2 - t1) / 1e6 > worst_ms[1]) worst_ms[1] = (t2 - t1) / 1e6;
         if (hos_now_ns() >= next_report) {
@@ -306,14 +387,19 @@ void hl_mem_init(void) {
     const int split_cold = hs && atoi(hs) > 0 && hc && atoi(hc) > 0;
     config.settle_passes = COLD_SETTLE_PASSES;
     heaps_on = want_heaps && !split_cold && hl_mem_cold_start(HL_MEM_COLD_HEAPS, &config);
+    const char *li = getenv("HL_MEM_COLD_LISTED");
+    heaps_listed_on = li && li[0] ? atoi(li) != 0 : HL_MEM_COLD_LISTED_DEFAULT;
     cold_on = 1;
     hos_log("hl mem: cold pages: on: pages of pools with flags %s older than %lld s leave the working set (%d MB a pass at "
             "most, every %d ms; units that come back are left in 30 s, longer each time) (HL_MEM_COLD=0: not)",
             fl, (long long)(cold_age_ns / 1000000000LL), COLD_BUDGET_PAGES >> 8, COLD_PASS_MS);
     if (heaps_on)
         hos_log("hl mem: cold pages: on for the heaps too: their committed pages outside pools and stacks, a unit seen still "
-                "for %d s or more (%d MB a pass at most; none while 32 MB a second come back) (HL_MEM_COLD_HEAPS=0: not)",
-                COLD_SETTLE_PASSES * COLD_PASS_MS / 1000, COLD_BUDGET_PAGES >> 8);
+                "for %d s or more (%d MB a pass at most; none while 32 MB a second come back) (HL_MEM_COLD_HEAPS=0: not); their "
+                "ranges %s",
+                COLD_SETTLE_PASSES * COLD_PASS_MS / 1000, COLD_BUDGET_PAGES >> 8,
+                heaps_listed_on ? "from the heap and the address regions, no VirtualQuery (HL_MEM_COLD_LISTED=0: found with it)"
+                                : "found with VirtualQuery (HL_MEM_COLD_LISTED=0)");
     else
         hos_log("hl mem: cold pages: not for the heaps (%s)", !want_heaps ? "HL_MEM_COLD_HEAPS=0"
                                                                  : split_cold ? "HOS_HEAP_SPLIT_COLD measures"

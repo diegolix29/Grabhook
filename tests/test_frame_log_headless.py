@@ -72,7 +72,7 @@ def main():
         if result.returncode or not csv.exists():
             raise SystemExit('FAIL: RX_VK_FRAME_LOG set, no file\n' + result.stdout + result.stderr)
         lines = csv.read_text(encoding='utf-8').splitlines()
-    if lines[0] != 'frame,time_s,frametime_ms' or len(lines) != 4:
+    if lines[0] != 'frame,time_s,frametime_ms,qpc' or len(lines) != 4:
         raise SystemExit('FAIL: a header and three lines expected:\n' + '\n'.join(lines))
     rows = [line.split(',') for line in lines[1:]]
     if [int(r[0]) for r in rows] != [0, 1, 2] or float(rows[0][1]) != 0 or float(rows[0][2]) != 0:
