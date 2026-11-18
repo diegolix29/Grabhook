@@ -48,7 +48,7 @@ std::map<uint64_t,Pool> imported;
 Pool *last_pool=nullptr,*pool_cache[4096]{};
 uint64_t max_import_size=128ull<<20;
 int failures=0,imports=0,retires=0,bg_starts=0;
-int64_t st_bg_waits=0,st_prefetch_used=0,st_prefetch_sent=0,st_prefetch_dropped=0;
+int64_t st_bg_waits=0,st_prefetch_used=0,st_prefetch_sent=0,st_prefetch_dropped=0,st_imports_asked=0;
 struct { bool external_memory_host=true; } dev;
 std::mutex bg_mu;std::condition_variable bg_done_cv,bg_cv;std::map<uint64_t,uint64_t> bg_inflight;
 std::deque<std::pair<uint64_t,uint64_t>> bg_queue;

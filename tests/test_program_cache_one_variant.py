@@ -48,7 +48,7 @@ def main():
     draw = (ROOT / "gpu/vk/vk_draw.cpp").read_text(encoding="utf-8")
     structs = "\n".join(block(header, m) + ";" for m in ("struct Stage {", "struct Program {"))
     structs += "\n" + block(cache_h, "struct DiskRecord {") + ";"
-    functions = "\n".join(block(shader, m) for m in ("VkShaderModule make_module(", "uint64_t answers_hash(", "bool answers_fit(", "bool spirv_uses_subgroups("))
+    functions = "\n".join(block(shader, m) for m in ("VkShaderModule make_module(", "uint64_t answers_hash(", "bool answers_fit("))
     functions += "\n" + block(cache, "void idx_put(")
     functions += "\n" + block(cache_h, "struct Reader {") + ";\n"
     functions += cache[cache.index("void put_bytes("):cache.index("void program_cache_save(")]

@@ -969,7 +969,7 @@ static void au_opened(HWAVEOUT w) {
     (void)w;
 #endif
 }
-/* The selected/default output's channels (its shared-mode mix format on Windows, SDL's default device on Linux); 2 when
+/* The selected/default output's channels (its shared-mode mix format on Windows, SDL's playback format on Linux); 2 when
    unknown. */
 #ifdef _WIN32
 /* (hookshot) The channels of a mix format that are 5.1 speakers: its channel count when its mask names a centre and a
@@ -1047,7 +1047,7 @@ static int au_menu_output(void) {
     return v < 1 ? 0 : v > 3 ? 3 : v;
 }
 /* The speakers the game mixes for: the Insert menu's Audio output, Stereo/Mono 2 or 5.1 6, HOS_AUDIO_CHANNELS=2 or 6 over it;
-   Auto: 6 when the default output has 5.1 or more, else 2. The game asks once, at its start
+   Auto: 6 when the default output has 5.1 or more speakers (au_layout_channels), else 2. The game asks once, at its start
    (GetActiveAudioDeviceChannelCountForOutput), and pans for that many, so a change takes a restart. Told 2 (always,
    before), it put nothing behind the player, and a 5.1 system played the whole game from the front speakers (issue
    1124). Its device sink has the six channels either way; with two speakers they are mixed down. */

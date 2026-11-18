@@ -20,6 +20,7 @@ enum { K_MUTEX = 1, K_COND, K_EVENT, K_SEMA, K_QUEUE, K_RWLOCK, K_MULTIWAIT, K_H
 typedef struct Obj {
     uint64_t key;
     int kind;
+    uint32_t ix;   /* mutex index in mx_objs once assigned (0: none): see obj_mutex_ix() */
     SRWLOCK lk;
     CONDITION_VARIABLE cv;
     /* mutex / rwlock */
@@ -208,9 +209,53 @@ static Obj *obj_lookup(uint64_t key, int kind);
    direct-mapped cache per thread answers those. An entry holds while its object is still that address's and of the
    kind asked for (objects are reused, never freed: spares). HOS_NO_OBJ_CACHE=1: off. */
 static Obj *obj_nockpt(uint64_t key, int kind);
+static int mx_ix_on(void);
+static Obj *obj_mutex_ix(uint64_t key);
 static Obj *obj(uint64_t key, int kind) {
     hos_vcore_checkpoint();   /* (virtual cores: every nn::os call, where a better waiter takes the core) */
+    if (kind == K_MUTEX && key && mx_ix_on()) return obj_mutex_ix(key);
     return obj_nockpt(key, kind);
+}
+/* (a fork's code, GPL-3.0; HOS_MUTEX_IX=1, off by default) A mutex's host object found by an index kept in its
+   nn::os::MutexType + 8, the SDK's nesting-count word, unused here (the count is Obj::count). Checked against Obj::key and
+   Obj::kind, so a copied, zeroed or reused mutex falls back to obj_nockpt and is numbered again. Only for obj's nn::os
+   calls: obj_nockpt, used under host locks, stays as it was */
+#define MX_IX_OFFSET 8
+#define MX_IX_CAP (1u << 20)
+static Obj *mx_objs[MX_IX_CAP];
+static volatile long mx_next = 1;
+static int mx_ix_on(void) {
+    static int v = -1;
+    if (v < 0) v = env_on("HOS_MUTEX_IX");
+    return v;
+}
+static Obj *obj_mutex_ix(uint64_t key) {
+    const int kind = K_MUTEX;
+    uint32_t *at = (uint32_t *)GP(key + MX_IX_OFFSET);
+    const uint32_t ix = __atomic_load_n(at, __ATOMIC_RELAXED);
+    if (ix && ix < MX_IX_CAP) {
+        Obj *o = __atomic_load_n(&mx_objs[ix], __ATOMIC_ACQUIRE);
+        if (o && __atomic_load_n(&o->key, __ATOMIC_RELAXED) == key && __atomic_load_n(&o->kind, __ATOMIC_ACQUIRE) == K_MUTEX)
+            return o;
+    }
+    Obj *o = obj_nockpt(key, kind);
+    uint32_t mine = __atomic_load_n(&o->ix, __ATOMIC_RELAXED);
+    if (!mine && __atomic_load_n(&mx_next, __ATOMIC_RELAXED) < (long)MX_IX_CAP) {
+        const long n = __sync_fetch_and_add(&mx_next, 1);
+        if (n < (long)MX_IX_CAP) {
+            uint32_t none = 0;
+            if (__atomic_compare_exchange_n(&o->ix, &none, (uint32_t)n, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) {
+                __atomic_store_n(&mx_objs[n], o, __ATOMIC_RELEASE);
+                mine = (uint32_t)n;
+            } else {
+                mine = none;
+            }
+        }
+    }
+    if (mine && __atomic_load_n(&mx_objs[mine], __ATOMIC_RELAXED) == o &&
+        __atomic_load_n(at, __ATOMIC_RELAXED) != mine)
+        __atomic_store_n(at, mine, __ATOMIC_RELAXED);
+    return o;
 }
 /* obj without the checkpoint, for lookups under a host lock: a checkpoint there can give the core up and wait for one
    while the lock is held, and a thread that holds a core can then block on that lock (wait_any's scan under mw_lock vs
@@ -574,6 +619,7 @@ HLE(_ZN2nn2os15InitializeMutexEPNS0_9MutexTypeEbi) {
 }
 HLE(_ZN2nn2os13FinalizeMutexEPNS0_9MutexTypeE) {
     if (watched(ARG(0))) watch_log("finalize", ARG(0), 0, c, NULL);
+    if (ARG(0) && mx_ix_on()) __atomic_store_n((uint32_t *)GP(ARG(0) + MX_IX_OFFSET), 0u, __ATOMIC_RELAXED);
     drop(ARG(0));
 }
 HLE(_ZN2nn2os9LockMutexEPNS0_9MutexTypeE) {
@@ -763,6 +809,8 @@ static int event_peek(Obj *e) {
 
 /* SignalEvent from host code (any host thread): devices the OS layer emulates, the video decoder for one. */
 void hos_event_signal(uint64_t guest_event) { event_signal(obj(guest_event, K_EVENT)); }
+/* (an event of the OS layer's own making: nn::nfp's, host/nn_nfp.c) */
+void hos_event_init(uint64_t guest_event, int signaled, int clear_mode) { event_init(guest_event, signaled, clear_mode); }
 
 HLE(_ZN2nn2os15InitializeEventEPNS0_9EventTypeEbNS0_14EventClearModeE) { event_init(ARG(0), (int)(ARG(1) & 1), (int)ARG(2)); }
 HLE(_ZN2nn2os13FinalizeEventEPNS0_9EventTypeE) { drop(ARG(0)); }

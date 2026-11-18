@@ -7,7 +7,7 @@ shape in the middle of a wider picture (a narrower one: its whole width), pre-re
 and the picture a save keeps shows that middle 16:9 (a narrower picture: its middle band, at the texture's shape). Every patch reads host globals
 (host/hos_wide.c) that stay 0 for a 16:9 window, so the game runs as shipped then.
 
-The sites and what each does come from NX2navi's recomp/patches-v111.txt, where they are credited to Ivan0xFF (MIT,
+The sites and what each does come from a list of patches credited to Ivan0xFF (MIT,
 "The matrix-update, UI and movie sites: Copyright (c) 2026 Ivan0xFF"); the picture and scene size sites are the same
 constants that file names; the save picture's site is Hookshot's own (issue 952). Here each is written as C after the
 original instruction instead of a replacement of it.

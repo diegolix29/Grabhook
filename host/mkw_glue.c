@@ -10,11 +10,13 @@
 #endif
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #ifndef _WIN32
 #include <dlfcn.h>
 #include <execinfo.h>
+#include <sys/sysinfo.h>
 #endif
 
 /* ---- the guest window ---------------------------------------------------------------------------------------
@@ -60,17 +62,117 @@ static int commit_wait(void *p, SIZE_T size) {
     if (InterlockedIncrement(&waits) <= 8) hos_log("mem: commit of %#llx bytes still refused after 5 s at the commit limit", (unsigned long long)size);
     return 0;
 }
-/* (a commit that failed: the line, and at the commit limit Windows' out-of-memory notice, said once, on its own thread) */
+/* (hookshot) The out-of-memory line and notice, said once for the run, by whichever runs out first: a guest commit
+   (commit_refused) or the host's own allocation (hos_alloc_failed). oom_state: 0 not said, 1 the notice up (or about to be), 2 said
+   and the notice closed (or none: HOS_HEADLESS, or no thread for it). The notice is on a thread of its own. wait 0: the caller
+   goes on; wait 1: the caller ends the game next, so it waits until the notice (its own or one already up) is closed, rather
+   than end the process before the player could read it */
+DWORD WINAPI hos_out_of_memory_box(LPVOID unused);
+static volatile LONG oom_state;
+static DWORD WINAPI oom_box(LPVOID unused) {
+    hos_out_of_memory_box(unused);
+    InterlockedExchange(&oom_state, 2);
+    return 0;
+}
+void hos_out_of_memory(int wait) {
+    if (InterlockedCompareExchange(&oom_state, 1, 0) == 0) {
+#ifdef _WIN32
+        hos_log("mem: Windows is out of memory (RAM and page file): close other programs, or let Windows manage the page file size");
+#else
+        hos_log("mem: out of memory (RAM and swap): close other programs, or add swap");
+#endif
+        /* (on a thread of its own either way: on the game's thread that ran out, sead::MainThread, MessageBoxA came back at
+           once and showed nothing) */
+        HANDLE t = NULL;
+        if (env_on("HOS_HEADLESS")) InterlockedExchange(&oom_state, 2);
+        else if ((t = CreateThread(NULL, 0, oom_box, wait ? (LPVOID)1 : NULL, 0, NULL)) != NULL) CloseHandle(t);
+        else InterlockedExchange(&oom_state, 2);
+    }
+    while (wait && InterlockedCompareExchange(&oom_state, 1, 1) == 1) Sleep(100);
+}
+/* (a commit that failed: the line, and at the commit limit the out-of-memory notice, said once, on its own thread) */
 static void commit_refused(uint64_t lo, uint64_t size, DWORD err) {
     hos_log("mem: commit of %#llx bytes at %#llx failed (error %lu)", (unsigned long long)size, (unsigned long long)lo, err);
-    if (err == ERROR_COMMITMENT_LIMIT) {   /* (1455: RAM and page file full; the game crashes soon after) */
-        static volatile LONG said;
-        if (InterlockedExchange(&said, 1) == 0) {
-            hos_log("mem: Windows is out of memory (RAM and page file): close other programs, or let Windows manage the page file size");
-            extern DWORD WINAPI hos_out_of_memory_box(LPVOID);
-            CloseHandle(CreateThread(NULL, 0, hos_out_of_memory_box, NULL, 0, NULL));
+    if (err == ERROR_COMMITMENT_LIMIT) hos_out_of_memory(0);   /* (1455: RAM and page file full; the game crashes soon after) */
+}
+
+/* (hookshot) The host's own allocations that the game cannot go on without (the NVN layer's recording buffers and
+   tables, the video service's): at the commit limit malloc fails as a guest commit does, and the game ended at once with a fatal
+   naming the table ("native NVN: recording handle set"), with no wait and no out-of-memory notice. A failed one is now tried
+   again for up to 5 s, as commit_wait does, while the renderer's textures give commit back; past that comes the line, the
+   notice (waited for: the game stops right after) and the fatal, which says out of memory. Never NULL. kind: 'm' malloc(size),
+   'c' calloc(count, size), 'r' realloc(old, size). An allocation that fails with plenty of commit left is not the limit (a
+   size gone wrong): its fatal says so, after the same wait.
+   HOS_TEST_ALLOC_REFUSE=<text>: every allocation through here whose label contains the text is refused, the tries again too,
+   as at the limit, to see the wait, the line, the notice and the stop in a run (a test, off when unset) */
+static int alloc_refused(const char *what) {
+    static const char *volatile refuse = (const char *)1;   /* (1: not read yet; read once, every thread reads the same) */
+    if (refuse == (const char *)1) {
+        const char *e = getenv("HOS_TEST_ALLOC_REFUSE");
+        refuse = e && *e ? e : NULL;
+    }
+    const char *r = refuse;
+    return r && strstr(what, r) != NULL;
+}
+static void *alloc_try(int kind, void *old, size_t count, size_t size, const char *what) {
+    if (alloc_refused(what)) return NULL;
+    return kind == 'c' ? calloc(count, size) : kind == 'r' ? realloc(old, size) : malloc(size);
+}
+void *hos_alloc_failed(int kind, void *old, size_t count, size_t size, const char *what) {
+    if (kind == 'c' && size && count > (size_t)-1 / size)
+        hos_fatal(NULL, "%s: %zu x %zu bytes is past the address space", what, count, size);
+    const size_t n = kind == 'c' ? count * size : size;
+    static volatile LONG recovered;
+    for (int i = 0; i < 100; i++) {   /* (100 x 50 ms, as commit_wait) */
+        Sleep(50);
+        void *p = alloc_try(kind, old, count, size, what);
+        if (p) {
+            const LONG k = InterlockedIncrement(&recovered);
+            if (k <= 8 || (k & 255) == 0)
+                hos_log("mem: %s: %zu bytes of host memory at the commit limit allocated after %d ms (%ld so far)", what, n,
+                        (i + 1) * 50, (long)k);
+            return p;
         }
     }
+    hos_alloc_gave_up(n, what);
+    return NULL;
+}
+/* An allocation refused for 5 s: past the limit's wait, the line, the notice (waited for) and the fatal, which says
+   out of memory; with over a GB more than it asked for still free, not the limit (a size gone wrong): a fatal that says so, no
+   notice. hos_alloc_failed's end, and the renderer's: its new_handler (gpu/vk/vk_main.cpp new_refused) tried its C++
+   allocation again for the same 5 s, and it does not know the size: n 0, said with none */
+void hos_alloc_gave_up(size_t n, const char *what) {
+    unsigned long long left = 0;   /* (MB of commit left: RAM and page file; on Linux free RAM and swap) */
+#ifdef _WIN32
+    MEMORYSTATUSEX m = {.dwLength = sizeof m};
+    if (GlobalMemoryStatusEx(&m)) left = m.ullAvailPageFile >> 20;
+#else
+    struct sysinfo si;
+    if (!sysinfo(&si)) left = ((unsigned long long)si.freeram + si.bufferram + si.freeswap) * si.mem_unit >> 20;
+#endif
+    char bytes[64] = "", size[48] = "";   /* ("n bytes of host memory " and " (n bytes)", or nothing when the size is not known) */
+    if (n) snprintf(bytes, sizeof bytes, "%zu bytes of host memory ", n), snprintf(size, sizeof size, " (%zu bytes)", n);
+    if (left > (n >> 20) + 1024 && !alloc_refused(what))   /* (over a GB more than it asked for: not the limit) */
+        hos_fatal(NULL, "%s: %srefused for 5 s with %llu MB of commit left", what, bytes, left);
+    hos_log("mem: %s: %sstill refused after 5 s at the commit limit (%llu MB of commit left)", what, bytes, left);
+    hos_out_of_memory(1);
+#ifdef _WIN32
+    hos_fatal(NULL, "out of memory (RAM plus the page file): %s%s", what, size);
+#else
+    hos_fatal(NULL, "out of memory (RAM plus swap): %s%s", what, size);
+#endif
+}
+void *hos_xmalloc(size_t size, const char *what) {
+    void *p = alloc_try('m', NULL, 1, size, what);
+    return p || !size ? p : hos_alloc_failed('m', NULL, 1, size, what);
+}
+void *hos_xcalloc(size_t count, size_t size, const char *what) {
+    void *p = alloc_try('c', NULL, count, size, what);
+    return p || !count || !size ? p : hos_alloc_failed('c', NULL, count, size, what);
+}
+void *hos_xrealloc(void *old, size_t size, const char *what) {
+    void *p = alloc_try('r', old, 1, size, what);
+    return p || !size ? p : hos_alloc_failed('r', old, 1, size, what);
 }
 
 /* HOS_GUEST_PAGES=1 (hos_guestpages.c): the window in two reservations, the system region and the image below
@@ -148,14 +250,22 @@ int hos_commit(uint64_t addr, uint64_t size) {
     return 1;
 }
 
-DWORD WINAPI hos_out_of_memory_box(LPVOID unused) {
-    (void)unused;
-    MessageBoxA(NULL,
-                "Windows has run out of memory (RAM plus the page file), so Hookshot may close.\n\n"
-                "Close other programs, and in Windows' System > About > Advanced system settings > Performance > Advanced > Virtual "
-                "memory, choose \"Automatically manage paging file size\" (or give it at least 16 GB). A lower Quality preset in the "
-                "Insert menu also uses less memory.",
-                "Hookshot: out of memory", MB_OK | MB_ICONWARNING | MB_TOPMOST);
+/* (closing: not NULL from a caller that stops the game once the notice is closed) */
+DWORD WINAPI hos_out_of_memory_box(LPVOID closing) {
+    char text[640];
+#ifdef _WIN32
+    snprintf(text, sizeof text,
+             "Windows has run out of memory (RAM plus the page file), so Hookshot %s.\n\n"
+             "Close other programs, and in Windows' System > About > Advanced system settings > Performance > Advanced > Virtual "
+             "memory, choose \"Automatically manage paging file size\" (or give it at least 16 GB). A lower Quality preset in the "
+             "Insert menu also uses less memory.", closing ? "has to close" : "may close");
+#else
+    snprintf(text, sizeof text,
+             "The PC has run out of memory (RAM plus swap), so Hookshot %s.\n\n"
+             "Close other programs, or add swap. A lower Quality preset in the Insert menu also uses less memory.",
+             closing ? "has to close" : "may close");
+#endif
+    MessageBoxA(NULL, text, "Hookshot: out of memory", MB_OK | MB_ICONWARNING | MB_TOPMOST);
     return 0;
 }
 
@@ -276,6 +386,66 @@ void hos_crash_record_prepare(const char *log_path) {
     hos_crash_record_start(path, hos_version(), log_path);
 }
 
+#ifdef _WIN32
+/* (hookshot) The x64 stack walks below (the crash report's, HOS_SAMPLE's and HOS_SAMPLE_ALL's) go one frame at a time
+   through unwind_step, which reads only the walked thread's own stack. RtlVirtualUnwind reads the frame's saved registers
+   and its return address at the stack pointer, or through the frame register when the function has one; a thread stopped
+   where its unwind data does not describe the frame (being made or ending, switching stacks, mid-prologue) gave it a
+   stack pointer that was not a stack, and its read faulted in the sampler's thread, which took the game down (0xc0000005
+   at ntdll.dll, reading 0x438, from sample_all_thread). The host is C without SEH (no -fms-extensions), so the walk is made
+   unable to fault rather than guarded: a step whose stack pointer, or frame register, is outside [lo, hi), the thread's
+   committed stack, ends the walk there, and the sample is only cut short */
+typedef struct { uint64_t lo, hi; } StackRange;
+/* a thread's committed stack (its TEB's StackLimit to StackBase), read while it is suspended; {0, 0} when it can't be */
+static StackRange thread_stack(HANDLE th) {
+    typedef LONG(NTAPI * QueryThread)(HANDLE, int, PVOID, ULONG, PULONG);
+    static QueryThread query;
+    static int looked;
+    if (!looked) {
+        query = (QueryThread)(void *)GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtQueryInformationThread");
+        looked = 1;
+    }
+    struct {   /* (THREAD_BASIC_INFORMATION, ThreadBasicInformation = 0: not in the SDK's headers) */
+        LONG exit_status;
+        NT_TIB *teb;
+        void *process, *thread;
+        ULONG_PTR affinity;
+        LONG priority, base_priority;
+    } tbi = {0};
+    StackRange r = {0, 0};
+    if (query && query(th, 0, &tbi, sizeof tbi, NULL) >= 0 && tbi.teb) {
+        r.lo = (uint64_t)tbi.teb->StackLimit;
+        r.hi = (uint64_t)tbi.teb->StackBase;
+    }
+    return r;
+}
+static StackRange own_stack(void) {
+    const NT_TIB *tib = (const NT_TIB *)NtCurrentTeb();
+    StackRange r = {(uint64_t)tib->StackLimit, (uint64_t)tib->StackBase};
+    return r;
+}
+static int on_stack(StackRange s, uint64_t p) { return p >= s.lo && p + 8 <= s.hi; }
+/* one frame up: 1 when ctx is now its caller's frame, 0 when the walk ends (no unwind data, or a step that would read
+   outside the stack s). An empty s ({0, 0}: its limits could not be read) ends every walk at its first frame */
+static int unwind_step(CONTEXT *ctx, StackRange s) {
+    if (!on_stack(s, ctx->Rsp)) return 0;
+    DWORD64 image = 0;
+    PRUNTIME_FUNCTION f = RtlLookupFunctionEntry(ctx->Rip, &image, NULL);
+    if (!f) return 0;
+    /* (UNWIND_INFO: the low nibble of its fourth byte is the frame register, 0 for none; registers 0 to 15 are Rax to R15,
+       in CONTEXT's order. An entry whose UnwindData has its low bit set points at the RUNTIME_FUNCTION that has it) */
+    const RUNTIME_FUNCTION *rf = f;
+    if (rf->UnwindData & 1) rf = (const RUNTIME_FUNCTION *)(image + (rf->UnwindData & ~1u));
+    const BYTE *info = (const BYTE *)(image + rf->UnwindData);
+    const unsigned frame_reg = info[3] & 15;
+    if (frame_reg && !on_stack(s, (&ctx->Rax)[frame_reg])) return 0;
+    void *handler_data;
+    DWORD64 frame;
+    RtlVirtualUnwind(UNW_FLAG_NHANDLER, image, ctx->Rip, f, ctx, &handler_data, &frame, NULL);
+    return on_stack(s, ctx->Rsp) || !ctx->Rip;
+}
+#endif
+
 static LONG WINAPI report_crash(EXCEPTION_POINTERS *info) {
     record_exception(info);
     EXCEPTION_RECORD *rec = info->ExceptionRecord;
@@ -302,6 +472,7 @@ static LONG WINAPI report_crash(EXCEPTION_POINTERS *info) {
 #ifdef _WIN32
     {   /* the host stack from the faulting frame (x64 unwind data), as module+offset (nx2/samap.py maps mkw.exe's) */
         CONTEXT ctx = *info->ContextRecord;
+        const StackRange stack = own_stack();
         char hb[1024];
         int n = snprintf(hb, sizeof hb, "CRASH: host backtrace:");
         for (int i = 0; i < 20 && ctx.Rip && n < (int)sizeof hb - 48; i++) {
@@ -312,12 +483,7 @@ static LONG WINAPI report_crash(EXCEPTION_POINTERS *info) {
                 GetModuleFileNameA(m, mn, MAX_PATH);
             const char *mb = strrchr(mn, '\\');
             n += snprintf(hb + n, sizeof hb - n, " %s+%#llx", mb ? mb + 1 : mn, (unsigned long long)(ctx.Rip - (uint64_t)m));
-            DWORD64 image = 0;
-            PRUNTIME_FUNCTION f = RtlLookupFunctionEntry(ctx.Rip, &image, NULL);
-            if (!f) break;
-            void *handler_data;
-            DWORD64 frame;
-            RtlVirtualUnwind(UNW_FLAG_NHANDLER, image, ctx.Rip, f, &ctx, &handler_data, &frame, NULL);
+            if (!unwind_step(&ctx, stack)) break;   /* (a fault in here would be a second crash inside the report) */
         }
         hos_log("%s", hb);
     }
@@ -428,7 +594,7 @@ void hos_commit_init(void) {
 }
 
 /* ---- stand-ins --------------------------------------------------------------------------------------------- */
-/* HOS_PROFILE=<seconds> (in place of TOTKPort's hos_prof.c): every interval, the process's busiest threads and their
+/* HOS_PROFILE_EVERY=<seconds> (in place of TOTKPort's hos_prof.c): every interval, the process's busiest threads and their
    share of a core (guest threads by their guest names, host threads by their descriptions): which one a frame rate
    waits for */
 #ifdef _WIN32
@@ -490,12 +656,12 @@ static DWORD WINAPI prof_thread(void *p) {
     }
     return 0;
 }
-/* HOS_SAMPLE=<thread name> (with HOS_PROFILE=<seconds>): that thread's instruction pointer sampled every millisecond;
+/* HOS_SAMPLE=<thread name> (with HOS_PROFILE_EVERY=<seconds>): that thread's instruction pointer sampled every millisecond;
    every interval the most frequent places, as module+offset of the leaf and of the first frame in mkw.exe under it
    (what of ours called into wgpu or the system). nx2/samap.py maps the mkw.exe offsets to functions. */
 static DWORD WINAPI sample_thread(void *p) {
     const char *want = (const char *)p;
-    const DWORD ms = (DWORD)atoi(getenv("HOS_PROFILE")) * 1000;
+    const DWORD ms = (DWORD)atoi(getenv("HOS_PROFILE_EVERY")) * 1000;
     HANDLE th = NULL;
     while (!th) {   /* (the renderer's threads start late) */
         Sleep(1000);
@@ -532,6 +698,7 @@ static DWORD WINAPI sample_thread(void *p) {
         CONTEXT ctx = {0};
         ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
         const BOOL got = GetThreadContext(th, &ctx);
+        const StackRange stack = got ? thread_stack(th) : (StackRange){0, 0};   /* (the walk stays on it) */
         uint64_t keys[2] = {0, 0};
         char stack_line[1024];
         int stack_len = 0;
@@ -558,12 +725,7 @@ static DWORD WINAPI sample_thread(void *p) {
                 if (depth == 0) keys[0] = key;
                 if (m == exe && !keys[1]) keys[1] = key;
                 if (m == exe && !stacks) break;
-                DWORD64 image = 0;
-                PRUNTIME_FUNCTION f = RtlLookupFunctionEntry(ctx.Rip, &image, NULL);
-                if (!f) break;
-                void *hd;
-                DWORD64 frame;
-                RtlVirtualUnwind(UNW_FLAG_NHANDLER, image, ctx.Rip, f, &ctx, &hd, &frame, NULL);
+                if (!unwind_step(&ctx, stack)) break;
             }
         }
         ResumeThread(th);
@@ -649,7 +811,7 @@ static DWORD WINAPI thread_times_thread(void *p) {
     return 0;
 }
 
-/* (hookshot) HOS_SAMPLE_ALL=<path> (with HOS_PROFILE): while <path>.go exists, every 2 ms every guest thread and the
+/* (hookshot) HOS_SAMPLE_ALL=<path> (on its own: not HOS_PROFILE_EVERY): while <path>.go exists, every 2 ms every guest thread and the
    renderer's threads (descriptions starting "mkw_vk") are sampled at the same instant: one line per thread,
    "<ms> <name>|<frames>", the frames module+offset leaf first (16 at most). What each thread does while another waits:
    the frame's critical path (scripts/crit.py) */
@@ -772,7 +934,7 @@ static LONG CALLBACK walk_guard(EXCEPTION_POINTERS *e) {
     InterlockedIncrement(&walk_faults);
     hos_sj_longjmp(walk_buf, 1);
 }
-__attribute__((noinline)) static void sample_walk(CONTEXT *ctx, char *line, int cap) {
+__attribute__((noinline)) static void sample_walk(CONTEXT *ctx, StackRange stack, char *line, int cap) {
     int len = walk_len;
     for (int depth = 0; depth < 16 && ctx->Rip && len < cap - 96; depth++) {
         HMODULE m = NULL;
@@ -791,12 +953,7 @@ __attribute__((noinline)) static void sample_walk(CONTEXT *ctx, char *line, int 
         len += snprintf(line + len, cap - len, "%s%s+%llx", depth ? ";" : "", mi < 0 ? "?" : sa_modname[mi],
                         (unsigned long long)(ctx->Rip - (uint64_t)m));
         walk_len = len;
-        DWORD64 image = 0;
-        PRUNTIME_FUNCTION f = RtlLookupFunctionEntry(ctx->Rip, &image, NULL);
-        if (!f) break;
-        void *hd;
-        DWORD64 frame;
-        RtlVirtualUnwind(UNW_FLAG_NHANDLER, image, ctx->Rip, f, ctx, &hd, &frame, NULL);
+        if (!unwind_step(ctx, stack)) break;
     }
 }
 static DWORD WINAPI sample_all_thread(void *p) {
@@ -811,8 +968,12 @@ static DWORD WINAPI sample_all_thread(void *p) {
     static char tn[MAXT][64];
     int nt = 0;
     int64_t t0 = 0;
+    /* (hookshot) HOS_SLOW_FRAMES (host/slow_frames.c): sampled the whole run into its ring, the thread list taken again every
+       5 s (threads come and go), nothing written here */
+    const int ring = path == hos_slow_frames_path();
+    int64_t listed_at = 0;
     for (;;) {
-        if (GetFileAttributesA(go) == INVALID_FILE_ATTRIBUTES) {
+        if (!ring && GetFileAttributesA(go) == INVALID_FILE_ATTRIBUTES) {
             if (out) {
                 fclose(out);
                 out = NULL;
@@ -821,9 +982,15 @@ static DWORD WINAPI sample_all_thread(void *p) {
             Sleep(200);
             continue;
         }
-        if (!out) {
+        int opened = 0;
+        if (!ring && !out) {
             out = fopen(path, "a");
             if (!out) { Sleep(1000); continue; }
+            opened = 1;
+        }
+        /* (the thread list taken again every 5 s, in both modes: threads come and go, and the profiling mode (HOS_PROFILE=1)
+           starts sampling at the boot, before the game's and the renderer's threads are made) */
+        if (opened || !listed_at || hos_now_ns() - listed_at > 5000000000LL) {
             for (int i = 0; i < nt; i++) CloseHandle(th[i]);
             nt = 0;
             static HANDLE gh[1024];
@@ -852,12 +1019,19 @@ static DWORD WINAPI sample_all_thread(void *p) {
                 nt++;
             }
             CloseHandle(snap);
-            t0 = hos_now_ns();
-            fprintf(out, "# t0_ns %lld\n", (long long)t0);   /* (the clock of HOS_CHAIN's records: scripts/chain.py) */
-            hos_log("prof: all-thread sampling of %d threads into %s", nt, path);
+            if (ring) {
+                if (!listed_at) hos_log("prof: slow frames: %d threads sampled every %d ms, written for a slow frame to %s-<n>.txt", nt,
+                                        hos_slow_frames_every_ms(), path);
+            } else if (opened) {
+                t0 = hos_now_ns();
+                fprintf(out, "# t0_ns %lld\n", (long long)t0);   /* (the clock of HOS_CHAIN's records: scripts/chain.py) */
+                hos_log("prof: all-thread sampling of %d threads into %s", nt, path);
+            }
+            listed_at = hos_now_ns();
         }
-        Sleep(2);
-        const long ms = (long)((hos_now_ns() - t0) / 1000000);
+        Sleep(ring ? hos_slow_frames_every_ms() : 2);
+        const int64_t sweep_ns = hos_now_ns();   /* (the ring's: one time a sweep) */
+        const long ms = (long)((sweep_ns - t0) / 1000000);
         for (int i = 0; i < nt; i++) {
             if (SuspendThread(th[i]) == (DWORD)-1) continue;
             /* (static: not in a register across the walk's second return) */
@@ -866,16 +1040,19 @@ static DWORD WINAPI sample_all_thread(void *p) {
             memset(&ctx, 0, sizeof ctx);
             ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
             const BOOL got = GetThreadContext(th[i], &ctx);
+            const StackRange stack = got ? thread_stack(th[i]) : (StackRange){0, 0};   /* (the walk stays on it) */
             walk_len = snprintf(line, sizeof line, "%ld %s|", ms, tn[i]);
             if (got && recomp_sj_setjmp(walk_buf) == 0) {
                 walk_on = 1;
-                sample_walk(&ctx, line, (int)sizeof line);
+                sample_walk(&ctx, stack, line, (int)sizeof line);
             }
             walk_on = 0;
             line[walk_len] = 0;   /* (a faulted walk: the line ends after its last whole frame) */
             ResumeThread(th[i]);
-            fprintf(out, "%s\n", line);
+            if (ring) hos_slow_sample(sweep_ns, strchr(line, ' ') + 1);
+            else hos_sample_write(out, line);   /* (packed with HOS_SAMPLE_PACKED: host/profiling.c) */
         }
+        if (ring) hos_slow_sweep_done();
     }
     return 0;
 }
@@ -883,14 +1060,17 @@ static DWORD WINAPI sample_all_thread(void *p) {
 void hos_prof_start(void) {
     const char *tt = getenv("HOS_THREAD_TIMES");
     if (tt && atoi(tt) > 0) CreateThread(NULL, 0, thread_times_thread, (void *)(uintptr_t)atoi(tt), 0, NULL);
-    const char *e = getenv("HOS_PROFILE");
+    const char *e = getenv("HOS_PROFILE_EVERY");
     if (e && atoi(e) > 0) CreateThread(NULL, 0, prof_thread, (void *)(uintptr_t)atoi(e), 0, NULL);
     const char *s = getenv("HOS_SAMPLE");
     if (e && atoi(e) > 0 && s && *s) CreateThread(NULL, 0, sample_thread, (void *)s, 0, NULL);
     const char *all = getenv("HOS_SAMPLE_ALL");
     if (all && *all) CreateThread(NULL, 0, sample_all_thread, (void *)all, 0, NULL);
+    const char *slow = hos_slow_frames_path();   /* (hookshot: the slow-frame recorder, host/slow_frames.c) */
+    if (slow) CreateThread(NULL, 0, sample_all_thread, (void *)slow, 0, NULL);
     const char *watch = getenv("HOS_WATCH");
     if (watch && *watch) CreateThread(NULL, 0, watch_thread, (void *)watch, 0, NULL);
+    hos_profiling_start();   /* (hookshot: HOS_PROFILE=1, the profiling mode: host/profiling.c) */
 }
 #endif   /* (linux) host/posix/prof.c */
 void hos_mem_checkpoint(const char *what) { (void)what; }        /* (hos_prof.c: HOS_MEM_TIMELINE) */

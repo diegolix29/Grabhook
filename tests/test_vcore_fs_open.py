@@ -58,8 +58,6 @@ typedef struct { uint64_t x[32]; } Ctx;
 #define HOS_FS_PATH 1024
 #define R_PATH_NOT_FOUND 0x202
 static int hos_trace;
-static volatile long writes_open;   /* (files open for writing: host/nn_fs.c, hos_fs_writing) */
-static long InterlockedIncrement(volatile long *p) { return ++*p; }
 static int fs_trace(void) { return 0; }
 static void hos_log(const char *f, ...) { (void)f; }
 static const char *gstr(uint64_t a) { return (const char *)(uintptr_t)a; }
@@ -87,6 +85,7 @@ static HANDLE CreateFileA(const char *p, DWORD a, DWORD s, void *sa, DWORD d, DW
 }
 typedef struct { HANDLE h; int writable; char path[HOS_FS_PATH]; } Handle;
 static uint64_t new_handle(Handle *h) { free(h); return 7; }
+static int writes_open;
 
 @OPEN@
 

@@ -24,6 +24,7 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include "hos_crash_dialog.h"
 #include "hos_crash_record.h"
+#include "log_redact.h"
 #include "options_path.h"
 #include "../gpu/vk/compat/hookshot_env.h"
 #include <errno.h>
@@ -462,7 +463,7 @@ static int cmp_text(const void *a, const void *b) { return strcmp(*(char *const 
 /* The game's switches and what loads code into it, NAME=VALUE, a value only as hos_crash_value_shown allows (the menu's
    switches()) */
 static void put_switches(Buf *b) {
-    static const char *const prefixes[] = {"RX_", "HOS_", "HOOKSHOT_", "EDEN_", "NVN_", "SDL_"};
+    static const char *const prefixes[] = {"RX_", "HOS_", "HL_", "HOOKSHOT_", "EDEN_", "NVN_", "SDL_"};
     static const char *const hooks[] = {"VK_INSTANCE_LAYERS", "VK_LOADER_LAYERS_ENABLE", "VK_DRIVER_FILES", "VK_ICD_FILENAMES",
                                         "ENABLE_VKBASALT", "MANGOHUD", "LD_PRELOAD"};
     char *lines[512];
@@ -1049,7 +1050,12 @@ static int helper(const HosCrashArgs *a) {
     }
     HosCrashRecord r;
     hos_crash_record_parse(record ? record : "", &r);
-    if (find_run_log(log, a->log, run_id)) read_log(log, &s.who);
+    if (find_run_log(log, a->log, run_id)) {
+        /* (the game is gone: its log without the player's user name, what other code wrote to stderr itself too, before a player
+           sends it in; only this run's, which a start since may have moved to .1: host/log_redact.h) */
+        hos_log_redact_file(log->path, run_id);
+        read_log(log, &s.who);
+    }
     s.verdict = hos_crash_verdict(&r, &log->facts, have_exit, code, 0);
     if (a->mode == 2 && r.kind != 1) s.verdict = HOS_CRASH_QUIET;
 #ifdef _WIN32

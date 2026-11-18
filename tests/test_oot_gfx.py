@@ -55,7 +55,7 @@ class InstallTests(unittest.TestCase):
 
     def test_wired(self):
         lift = (ROOT / "nx2/lift.py").read_text(encoding="utf-8")
-        self.assertLess(lift.index("oot_gfx.install("), lift.index("L.discover("))
+        self.assertLess(lift.index("oot_gfx.install("), lift.index("discover.discover(L,"))
         replay = (ROOT / "gpu/vk/vk_replay.cpp").read_text(encoding="utf-8")
         for opt, field in (("FOLIAGE", "foliage"), ("OBJECTS", "objects"), ("GRASS", "grass"), ("SHADOWS", "shadows"),
                            ("CONTACT_SHADOWS", "contact_shadows"), ("BASE_QUALITY", "base_quality"),

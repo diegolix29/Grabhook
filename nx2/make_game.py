@@ -51,11 +51,14 @@ PY = [sys.executable, "-I", "-u", "-X", "utf8"]   # (utf8: every step's output i
 BUILD_ID = "e0f3ccfa"   # (the version the patches, the hot list and the profile were made from)
 STARTED = time.time()   # (the build's total time, kept in build_times.json and said as @@times)
 sys.path[:0] = [HERE, os.path.join(ROOT, "third_party", "a64-kit", "tools")]   # (python -I leaves the script folder off)
+import long_paths  # noqa: E402
+long_paths.install()   # (paths past 260 characters on Windows, before anything reads a file)
 import toolchain as _toolchain
 import disk as _disk
 import object_store as _object_store
 import lift_store as _lift_store
 import game_title
+import log_redact as _log_redact
 # (hookshot) RX_TARGET=windows on Linux: the Windows game, with llvm-mingw's Linux release (HOOKSHOT_MINGW, or llvm-mingw
 # beside the builder), to run under Proton or copy to a Windows PC
 LINUX, CROSS = not _toolchain.windows(), _toolchain.windows() and os.name != "nt"
@@ -233,9 +236,15 @@ def build_log(path):
         log = open(path, "w", encoding="utf-8", newline="\n")
     except OSError as e:
         fail("Could not open build log %s: %s" % (path, e))
+    # (the file without the player's user name, as the game writes its own log: players attach it to build problems. The
+    # console, which a launcher reads, as it is: nx2/log_redact.py)
+    saved = _log_redact.RedactedLines(log)
     with log:
-        with contextlib.redirect_stdout(LogStream(sys.stdout, log)), contextlib.redirect_stderr(LogStream(sys.stderr, log)):
-            yield
+        try:
+            with contextlib.redirect_stdout(LogStream(sys.stdout, saved)), contextlib.redirect_stderr(LogStream(sys.stderr, saved)):
+                yield
+        finally:
+            saved.close()
 
 
 TIMES_FORMAT = 1
@@ -533,7 +542,8 @@ def read_stamp(path):
     stamp that cannot be read is "", which no unpack's stamp equals"""
     with open(path, "rb") as f:
         raw = f.read()
-    for encoding in ("utf-8", locale.getencoding()):   # (getencoding: the code page also in Python's UTF-8 mode)
+    # (getencoding: the code page also in Python's UTF-8 mode; Python 3.11 and later, getpreferredencoding before)
+    for encoding in ("utf-8", getattr(locale, "getencoding", locale.getpreferredencoding)()):
         try:
             return raw.decode(encoding)
         except UnicodeDecodeError:
@@ -562,6 +572,7 @@ def keep_heads(out, game, stamp):
 
 
 DAMAGED_NOTE = "hookshot_damaged_files.txt"   # (in the game folder: the damaged game files the last unpack replaced)
+SHOWN_DAMAGED = 50   # (damaged files named in the log, the rest only in DAMAGED_NOTE: #1275's 1896 filled the launcher's log)
 
 
 def stand_in_damaged_files(out, romfs):
@@ -594,21 +605,29 @@ def stand_in_damaged_files(out, romfs):
               "minutes", flush=True)
         done = nup.stand_in_damaged(romfs, file_progress("checked"))
     else:   # (found while the .nup was extracted: no file opened again)
+        if known:   # (said before the stand-ins are looked for, so the log does not end at the extraction's last line)
+            print("%d damaged game file%s found while reading your game files: looking for stand-ins" %
+                  (len(known), "" if len(known) == 1 else "s"), flush=True)
         done = nup.stand_in_damaged(romfs, damaged=[os.path.normpath(os.path.join(romfs, rel)) for rel in known])
     note = os.path.join(out, DAMAGED_NOTE)
     if not done:
         with contextlib.suppress(FileNotFoundError):   # (a whole dump unpacked over a damaged one)
             os.remove(note)
     else:
+        too_many = len(done) > nup.MOST_STAND_INS   # (none was looked for: nup.stand_in_damaged)
         lines = ["Your game dump is incomplete: %d game file%s in it %s damaged (a complete dump is about 23.8 GB, an incomplete "
-                 "one 23.3 GB). Similar files are used where available, "
-                 "with different textures in those places. Dump the game again for the original files:" %
-                 (len(done), "" if len(done) == 1 else "s", "is" if len(done) == 1 else "are")]
+                 "one 23.3 GB). %s Dump the game again for the original files:" %
+                 (len(done), "" if len(done) == 1 else "s", "is" if len(done) == 1 else "are",
+                  "That is too many to replace with similar files (an incomplete dump has a few)." if too_many else
+                  "Similar files are used where available, with different textures in those places.")]
         for path, other in done:
             lines.append("  %s: %s" % (os.path.relpath(path, romfs),
                                        "in its place " + os.path.basename(other) if other else "no replacement found; build cannot continue"))
-        for line in lines:
+        shown = 1 + SHOWN_DAMAGED   # (the first line, then the files: the note keeps them all)
+        for line in lines[:shown]:
             print(line, flush=True)
+        if len(lines) > shown:
+            print("  ... and %d more, listed in %s" % (len(lines) - shown, note), flush=True)
         # (#2237: keep the list even when an unresolved file stops this build, before marking a successful check)
         with open(note, "w", encoding="utf-8", newline="\n") as f:
             f.write("\n".join(lines) + "\n")
@@ -623,14 +642,21 @@ def stand_in_damaged_files(out, romfs):
 
 
 ROMFS_TABLE = "ResourceSizeTable.Product.111.Nin_Ounce_NVN2.rsizetable.zs"   # (the supported version's, in System/Resource)
-def romfs_problem(romfs):
+def romfs_problem(romfs, nup=None):
     """Why a romfs folder chosen by hand is not the supported game's RomFS, or None. A romfs taken from another PC
     port's folder (a few packed .bin files, no subfolders) was accepted, built for 40 minutes, and the game died in its first
-    second: its own allocator returned null. The game's RomFS has System/Resource/<the table above> and hundreds of folders"""
+    second: its own allocator returned null. The game's RomFS has System/Resource/<the table above> and hundreds of folders.
+    nup: the romfs was read from this .nup file, whose code is the supported build's: a dump with the update's code and the
+    first version's files was built in full, and the game then said at each start that its files are another version's"""
     res = os.path.join(romfs, "System", "Resource")
     if os.path.isfile(os.path.join(res, ROMFS_TABLE)):
         return None
     others = sorted(f for f in os.listdir(res) if f.startswith("ResourceSizeTable")) if os.path.isdir(res) else []
+    if nup:
+        return ("The game files in %s are %s (Hookshot needs the version whose files have System\\Resource\\%s), while its code is "
+                "the supported version's. The game's code and files must be from the same version: dump the game again with its "
+                "update applied to the whole game, files included, and choose that dump."
+                % (nup, "from another version of the game (%s)" % others[0] if others else "not the game's own RomFS", ROMFS_TABLE))
     if others:
         return ("The romfs folder %s is from another version of the game (%s). Hookshot needs the version whose romfs has "
                 "System\\Resource\\%s: dump the game with its update applied, and use that romfs with the exefs from the same "
@@ -891,6 +917,44 @@ def bundled_mingw():
     return os.environ.get("HOOKSHOT_MINGW", "")
 
 
+def compiler_failure(r):
+    """What a compiler run that failed said, for one line of a message: its first error, else its last line (clang that
+    could not start said only "<clang.exe>: permission denied", and the message had "no message"), with the exit code when it
+    names no error. A Windows code is an NTSTATUS in hex (0xC0000135: a DLL not found; 0xC0000022: access denied)"""
+    lines = [l.strip() for l in (r.stderr + "\n" + r.stdout).splitlines() if l.strip()]
+    errors = [l for l in lines if "error" in l]
+    if errors:
+        return errors[0]
+    code = "exit code 0x%08X" % (r.returncode & 0xFFFFFFFF) if os.name == "nt" else "exit code %d" % r.returncode
+    return "%s, %s" % (lines[-1], code) if lines else "no output, %s" % code
+
+
+def unlistable_above(path):
+    """The highest folder above path that Windows lets no program list, or None. The compiler (LLVM) looks up its own
+    long name as it starts (GetLongPathNameW), which lists every folder on the way: C:\\Users\\<name>\\Cookies and the other junctions
+    Windows keeps for old programs deny everyone that, and a Desktop moved into one took the launcher there. The launcher says it
+    before it runs the builder (MakeGameRun.Blocked); this is for a builder run otherwise. Windows only"""
+    if os.name != "nt":
+        return None
+    chain = []
+    at = os.path.dirname(os.path.abspath(path))
+    while True:
+        chain.append(at)
+        up = os.path.dirname(at)
+        if up == at:
+            break
+        at = up
+    for folder in reversed(chain):   # (the drive first: the folder named is the one to move out of)
+        try:
+            with os.scandir(folder) as entries:
+                next(entries, None)
+        except PermissionError:
+            return folder
+        except OSError:
+            pass   # (a folder not there, or another error: not this one's to say)
+    return None
+
+
 def check_mingw():
     """The bundled compiler builds and links a Windows program: found now, not 40 minutes in"""
     sys.path.insert(0, os.path.join(ROOT, "third_party", "a64-kit", "tools"))
@@ -907,9 +971,12 @@ def check_mingw():
                            [src, "-o", os.path.join(d, "t.exe")], capture_output=True, text=True, encoding="utf-8", errors="replace")
     if r.returncode:
         print(r.stdout + r.stderr, flush=True)
-        errors = [l for l in r.stderr.splitlines() if "error" in l]
+        blocked = unlistable_above(cc)
+        if blocked:   # (LLVM's tools stop at once there, "<clang.exe>: permission denied", before they compile anything)
+            fail("Windows doesn't let programs look inside %s, a folder above the builder's own compiler, so it can't start. Move "
+                 "Hookshot's folder out of it (for example to C:\\Hookshot) and start Hookshot from there." % blocked)
         fail("The builder's own compiler (tools/llvm-mingw) could not build a test program: %s. Unpack the zip again into a folder "
-             "your antivirus allows." % (errors[0] if errors else "no message"))
+             "your antivirus allows." % compiler_failure(r))
     print("the compiler: %s (no Visual Studio needed)" % os.environ["HOOKSHOT_MINGW"], flush=True)
 
 
@@ -1639,7 +1706,8 @@ def build_language(a, out):
 
 def profile_readable(prof, any_os=False):
     """(linux) the profile is made by a recent clang (the Windows tools'): an older one, the system's, cannot read it and stops the
-    build. Then the game is built without it (a little slower in play), not at all. any_os: asked on Windows too (the renderer's
+    build. Then the game is built without it (a little slower in play), not at all, and the line says which clang and where the
+    one that reads it is (profile_unread_message). any_os: asked on Windows too (the renderer's
     committed profile is recorded on Linux, and llvm-mingw's clang is another LLVM)"""
     if not LINUX and not any_os:
         return True
@@ -1653,9 +1721,36 @@ def profile_readable(prof, any_os=False):
         r = subprocess.run([toolchain.find("clang"), "-O2", "-Wno-everything", "-fprofile-instr-use=" + prof, "-c", src, "-o",
                             os.path.join(d, "t.o")], capture_output=True, text=True, encoding="utf-8", errors="replace", **quiet)
     if r.returncode:
-        print("this compiler cannot read the play profile (%s): building without it" % (r.stderr.strip().splitlines() or ["?"])[-1],
-              flush=True)
+        ver = subprocess.run([toolchain.find("clang"), "--version"], capture_output=True, text=True, encoding="utf-8",
+                             errors="replace", **quiet).stdout
+        print(profile_unread_message(prof, ver, r.stderr, LINUX, build_tools_llvm()), flush=True)
     return r.returncode == 0
+
+
+def build_tools_llvm(root=ROOT):
+    """The LLVM of the Linux build tools (tools.lock's, the AppImage's: scripts/linux/deps.sh's LLVM_VER), or None without it"""
+    try:
+        with open(os.path.join(root, "scripts", "linux", "deps.sh"), encoding="utf-8") as f:
+            m = re.search(r"^LLVM_VER=(\S+)", f.read(), re.M)
+    except OSError:
+        return None
+    return m.group(1) if m else None
+
+
+def profile_unread_message(prof, version_text, stderr, linux, wanted):
+    """The line a build prints when this clang cannot read a play profile: which clang, which profile, what it costs (nothing
+    stops), and on Linux, with a clang older than the build tools' LLVM (a system clang: a distro's 18 reads no LLVM 23
+    profile), where the one that reads it is. version_text: clang --version's output; stderr: the test compile's"""
+    m = re.search(r"clang version (\d+)([\w.]*)", version_text or "")
+    who = "clang %s%s" % (m.group(1), m.group(2)) if m else "this compiler"
+    why = (stderr or "").strip().splitlines()
+    line = ("%s cannot read the play profile %s (%s): building without it, a little slower in play"
+            % (who, os.path.basename(prof), why[-1] if why else "no message"))
+    major = re.match(r"\d+", wanted or "")
+    if linux and major and (not m or int(m.group(1)) < int(major.group(0))):
+        line += (". The build tools' LLVM %s reads it: `python -I scripts/dev_build.py env` installs them and prints the "
+                 "variables that point the build at them (EMSDK), or install clang %s or newer" % (wanted, major.group(0)))
+    return line
 
 
 VK_PROFILE = "hookshot_vk.profdata"   # (the renderer's play profile, llvm-profdata's merge of an RX_VK_PGO=gen run's counters)
@@ -1890,8 +1985,7 @@ LIFT_ENV_NOT_OUTPUT = {   # (read by the lift's sources, and no change to what i
     "HOOKSHOT_LIFT_JOBS": "how many processes", "HOOKSHOT_LIFT_NO_FORK": "how they are started", "RX_JOBS": "how many processes",
     "EMSDK": "where the compiler is", "HOOKSHOT_MINGW": "where the compiler is",
     "A64_SITE_PROFILE": "the game's runtime (a64_rt.c), at play", "RX_VK_NAN_GUARD": "nx2/bake_ds's own run",
-    "RX_VK_NO_DRAW_PARAMS": "nx2/bake_ds's own run", "RX_VK_NO_F16": "nx2/bake_ds's own run",
-    "RX_VK_SHARED_48K": "nx2/bake_ds's own run",
+    "RX_VK_NO_F16": "nx2/bake_ds's own run",
     "HOS_MODS": "the mods folder: the ExeFS patches found in it are in the key by content (OOT_EXEFS_PATCHES_SHA1)",
     "HOS_NO_FASTFP": "the game's runtime (the lifted C reads it at play)",
 }
@@ -2749,6 +2843,9 @@ def main(a=None):
                 if not os.path.isdir(os.path.join(game, "romfs")):
                     fail("The package did not contain a romfs folder.")
                 check_unpacked_romfs(os.path.join(game, "romfs"), "Your .nup file %s" % a.nup)
+                why = romfs_problem(os.path.join(game, "romfs"), nup=a.nup)   # (the files' version, said before anything is built)
+                if why:
+                    fail(why)
             except (OSError, SystemExit):
                 try:
                     shutil.rmtree(game)
@@ -3095,7 +3192,8 @@ def main(a=None):
         note_shader_list(work, romfs, os.path.join(out, "hookshot_shaders.bin"))
     # (hookshot) Some dumps hold textures whose first kilobytes are zeros; the game cannot decode them and never finishes loading
     # the models that need one: the fairy fountains' floor and walls were not drawn, and as an adult the model was loaded again
-    # and again for good. tools/dump_repair.py writes a small mod that stands in for the ones it knows, from the player's own
+    # and again for good; a damaged piece of an area's baked lighting leaves what it lights black. tools/dump_repair.py finds
+    # every damaged texture and writes a small mod that stands in for those that have an intact relative, from the player's own
     # files; it was a step for the player to run by hand (README), now every build does it. Not worth stopping a build for
     repair = os.path.join(ROOT, "tools", "dump_repair.py")
     if os.path.isfile(repair) and run(PY + [repair, romfs, os.path.join(out, "mods", "00-dump-repair")], check=False,

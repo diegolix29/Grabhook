@@ -29,6 +29,7 @@ static int keep_dead;
 static int64_t hos_now_ns(void){return clock_ns;}
 static int env_on(const char *s){return !strcmp(s,"HOS_KEEP_DEAD_OBJECTS")&&keep_dead;}
 static void hos_vcore_checkpoint(void){}
+#define GP(a) ((void *)(uintptr_t)(a))   /* (the mutex index's guest pointer: HOS_MUTEX_IX is off here, never read) */
 static int assertions,failures;
 static void check(int ok,const char *why){assertions++;if(!ok){failures++;fprintf(stderr,"FAIL %s\n",why);}}
 /* Teardown can free the fixture's allocations even when the baseline deliberately loses a record.

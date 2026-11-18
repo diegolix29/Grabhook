@@ -15,27 +15,27 @@ VK = ROOT / "gpu" / "vk"
 
 
 def main():
-	tex = (VK / "vk_texture.cpp").read_text(encoding="utf-8")
-	body = tex[tex.index("bool upload_inner(Texture& tex, const Ranges* dirty) {"):]
-	body = body[:body.index("\n}\n")]
-	if "texture_resident_queue(&tex" not in body:
-		raise SystemExit("upload_inner no longer queues sparse binds: this test needs updating")
-	queued = body.index("texture_resident_queue(&tex")
-	# (every return false after the first staging call can leave binds queued by the rows before)
-	loop = body[body.index("const Staging st = staging((out_bytes"):queued]
-	at = 0
-	while True:
-		at = loop.find("return false;", at)
-		if at < 0:
-			break
-		before = loop[max(0, at - 400):at]
-		if "texture_resident_flush(&tex);" not in before[before.rfind("{"):]:
-			raise SystemExit("a sparse upload that fails part-way leaves its queued binds for another texture's flush")
-		at += 1
-	if "if (!st.buffer) return false;" in body:
-		raise SystemExit("a staging failure returns without binding the sparse blocks queued before it")
-	print("a sparse upload that fails part-way binds what it queued")
+    tex = (VK / "vk_texture.cpp").read_text(encoding="utf-8")
+    body = tex[tex.index("bool upload_inner(Texture& tex, const Ranges* dirty) {"):]
+    body = body[:body.index("\n}\n")]
+    if "texture_resident_queue(&tex" not in body:
+        raise SystemExit("upload_inner no longer queues sparse binds: this test needs updating")
+    queued = body.index("texture_resident_queue(&tex")
+    # (every return false after the first staging call can leave binds queued by the rows before)
+    loop = body[body.index("const Staging st = staging("):queued]
+    at = 0
+    while True:
+        at = loop.find("return false;", at)
+        if at < 0:
+            break
+        before = loop[max(0, at - 400):at]
+        if "texture_resident_flush(&tex);" not in before[before.rfind("{"):]:
+            raise SystemExit("a sparse upload that fails part-way leaves its queued binds for another texture's flush")
+        at += 1
+    if "if (!st.buffer) return false;" in body:
+        raise SystemExit("a staging failure returns without binding the sparse blocks queued before it")
+    print("a sparse upload that fails part-way binds what it queued")
 
 
 if __name__ == "__main__":
-	main()
+    main()

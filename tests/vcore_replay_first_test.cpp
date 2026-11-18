@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 
 #define CHECK(x) do { if (!(x)) { std::fprintf(stderr, "FAIL:%d %s\n", __LINE__, #x); std::exit(1); } } while (0)
 
@@ -14,6 +15,11 @@ struct HosThread {
     int vc_kick = 0;
     int vc_prio_over = 0;
     int64_t vc_since = 0, vc_took = 0, vc_cap_until = 0, vc_free_until = 0;
+    // (a long wait's cause, HOS_VCORE_LOG_MS: host/hos_thread.c)
+    int64_t vc_held_at = 0, vc_kick_at = 0, vc_by_held = 0, vc_by_asked = 0;
+    char vc_by[48] = {};
+    int vc_by_prio = 0;
+    char name[32] = "t";
     int vc_cv = 0;
     int acquires = 0, boost_at_acquire = -1;
     struct Ctx *run_ctx = nullptr;
@@ -63,7 +69,7 @@ int main() {
         reset();
         HosThread e = executor(), p = presenter(0);
         enqueue(&e, 1), enqueue(&p, 2);
-        vc_grant(0);
+        vc_grant(0, nullptr);
         CHECK(vc_owner[0] == &e && e.vc_held == 1 && e.vc_cv == 1 && !e.vc_queued);
         CHECK(!p.vc_held && p.vc_queued && vc_nq == 1);
     }
@@ -71,7 +77,7 @@ int main() {
         reset();
         HosThread e = executor(), p = presenter(2);
         enqueue(&e, 1), enqueue(&p, 2);
-        vc_grant(0);
+        vc_grant(0, nullptr);
         CHECK(vc_owner[0] == &p && p.vc_held == 1 && p.vc_cv == 1);
         CHECK(!e.vc_held && e.vc_queued);
         CHECK(vc_prio(&p) == 15 && vc_prio(&e) == 16 && vc_better(&p, &e) && !vc_better(&e, &p));
@@ -81,7 +87,7 @@ int main() {
         HosThread audio, p = presenter(2);
         audio.priority = 3;
         enqueue(&p, 1), enqueue(&audio, 2);
-        vc_grant(0);
+        vc_grant(0, nullptr);
         CHECK(vc_owner[0] == &audio && !p.vc_held);
     }
     {   // nor onto a core its mask leaves out
@@ -89,7 +95,7 @@ int main() {
         HosThread e = executor(), p = presenter(2);
         p.core_mask = 2;   // (core 1 only)
         enqueue(&e, 1), enqueue(&p, 2);
-        vc_grant(0);
+        vc_grant(0, nullptr);
         CHECK(vc_owner[0] == &e && !p.vc_held);
     }
     {   // holding the core with its place, it is not made to hand it to the executor at a checkpoint (strict) or a yield

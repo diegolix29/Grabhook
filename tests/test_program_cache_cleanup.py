@@ -51,7 +51,7 @@ class CacheModuleCleanupTests(unittest.TestCase):
         structs = '\n'.join(block(header, marker) + ';' for marker in ('struct Stage {', 'struct Program {'))
         structs += '\n' + block(source, 'struct DiskRecord {') + ';'
         functions = '\n'.join(block(source, marker) for marker in (
-            'bool spirv_uses_subgroups(', 'VkShaderModule make_module(', 'uint64_t answers_hash(', 'bool answers_fit(',
+            'VkShaderModule make_module(', 'uint64_t answers_hash(', 'bool answers_fit(',
             'void idx_put('))
         serialization = source[source.index('void put_bytes('):source.index('void program_cache_save(')]
         if 'struct Reader {' not in serialization:   # (the Reader is vk_progcache.h's, shared with vk_shader.cpp)

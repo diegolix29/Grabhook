@@ -49,6 +49,8 @@ FIXTURE = r'''
 #include "menu_restart.h"
 #include "gpu_choice.h"
 namespace gpu_choice = mkwvk::gpu_choice;
+#include "monitor_choice.h"
+namespace monitor_choice = mkwvk::monitor_choice;
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -132,6 +134,13 @@ std::string output_name_key(const char* text) { return text; }
 void refresh_outputs() {}
 bool can_outputs() { return false; }
 bool output_forced() { return false; }
+bool framegen_by_dlss_offered() { return true; }   // (vk_menu.cpp: Frame generation by offers DLSS FG)
+// (the Fullscreen monitor row: covered by test_fullscreen_monitor_menu.py)
+int monitor_pick;
+std::string monitor_want, monitor_saved_name;
+bool can_monitors() { return false; }
+void refresh_monitors() {}
+void monitor_chosen() {}
 void output_chosen() {}
 bool can_mods() { return false; }
 namespace i18n { int game_lang_index() { return 0; } }   // no external language.txt in this fixture
@@ -139,7 +148,8 @@ namespace i18n { int game_lang_index() { return 0; } }   // no external language
 constexpr int HOS_KEY_N = 1, HOS_SW_N = 1, HOS_SW_PLUS = 10, HOS_SW_MINUS = 11, HOS_BIND_PAD = 0, HOS_BIND_KEY = 1;
 constexpr int HOS_KEY_OC_NOTE_L = 1, HOS_KEY_OC_NOTE_X = 1;
 const char* const bind_names[HOS_KEY_N] = {"a"};
-struct Host { int (*binding)(int, int, int); float (*aspect_ratio)(); uint64_t (*mods_changed)(); void (*audio_output_select)(const char*); };
+struct Host { int (*binding)(int, int, int); float (*aspect_ratio)(); uint64_t (*mods_changed)(); void (*audio_output_select)(const char*);
+              void (*monitor_select)(const char*); };   // (the Fullscreen monitor row's choice: not called here)
 Host host_value{}, *host = &host_value;
 bool can_bind() { return false; }
 /* INI_KEY */

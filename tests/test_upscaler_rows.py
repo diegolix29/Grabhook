@@ -39,7 +39,7 @@ def main():
     order = ['"Output resolution", &opts.output_res', '"Upscaler", &opts.dlss', '"DLSS model", &opts.dlss_model',
              '"Render resolution", &opts.resolution', '"Sharpness", &opts.sharpness',
              '"Frame generation", &opts.framegen', '"Frame generation by", &opts.framegen_by',
-             '"Frame pacing", &opts.pace', '"NVIDIA Reflex", &opts.reflex',
+             '"NVIDIA Reflex", &opts.reflex',
              '"Window scaling filter", &opts.upscale']
     at = [menu.find(row) for row in order]
     if -1 in at:
@@ -191,7 +191,7 @@ def main():
     if "!temporal_wanted() && !temporal_off()" not in function(temporal, "void temporal_note_scene_draw("):
         raise SystemExit("temporal_note_scene_draw: no scene camera with Off, so the fixed shares' networks are never stretched")
     draw = (ROOT / "gpu" / "vk" / "vk_draw.cpp").read_text(encoding="utf-8")
-    if "(!temporal_wanted() && !temporal_off())" not in function(draw, "bool temporal_stand_in("):
+    if "(!temporal_wanted() && !temporal_off()" not in function(draw, "bool temporal_stand_in("):   # (and frame generation's inputs)
         raise SystemExit("temporal_stand_in: the game's network runs with Off")
     if "(temporal_wanted() || temporal_off() || fsr3_inputs::wanted()) && temporal_rejected_network(" not in function(draw, "bool upscale_stub("):
         raise SystemExit("upscale_stub: a network that did not translate is not stretched with Off, or not offered to FSR 3.1")

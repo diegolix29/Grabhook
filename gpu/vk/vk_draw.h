@@ -97,6 +97,9 @@ void pass_traces_log(uint64_t frame_lo, uint64_t frame_hi);   // (RX_VK_PASS_TRA
 uint64_t linux_pressure_shortfall(uint64_t* seq = nullptr);
 /// Changes with every uniform update the stream makes (vk_replay.cpp): descriptors bound before may be stale
 uint64_t ub_generation();
+/// (HL_UBO_MEMO) the update list as this thread sees it: its epoch (returned) and this thread's place in it. Whether an update overlaps
+/// a range is a function of these two, and of the range
+uint64_t ub_view(uint64_t* limit);
 /// A background thread (shader translation, pipeline builds) reads guest memory from the captures only, never the stream's
 /// uniform updates: that list is the replay's, which grows and is pruned while such a thread runs
 void ub_thread_off();
@@ -117,9 +120,9 @@ void pipeline_cache_play();   // (the start-up done: what play makes goes into p
 std::string state_list_snapshot(bool* present);
 
 /// The stream's uniform updates (UPDATE_UB, vk_replay.cpp) that overlap [addr, addr + n) and may not be in guest
-/// memory yet when the GPU reads it: a copy of the range with them applied, at the offset alloc returns in the
-/// recording's stream (mapped at base), or UINT64_MAX when none overlaps
-uint64_t ub_overlay(uint64_t addr, uint64_t n, uint8_t* base, const std::function<uint64_t(uint64_t)>& alloc);
+/// memory yet when the GPU reads it: a copy of the range with them applied, at the offset alloc(n, align) returns in
+/// the recording's stream (mapped at base), or UINT64_MAX when none overlaps
+uint64_t ub_overlay(uint64_t addr, uint64_t n, uint8_t* base, uint64_t (*alloc)(uint64_t n, uint64_t align), uint64_t align);
 /// (HL_UBO_INLINE) those updates copied onto p, the bytes an inline bind carried for [addr, addr + n)
 void ub_overlay_onto(uint64_t addr, uint64_t n, uint8_t* p);
 /// Guest memory as the stream's place sees it: as submitted, the stream's uniform updates before it over it

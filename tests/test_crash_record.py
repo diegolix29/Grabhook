@@ -52,7 +52,10 @@ def source_contract():
     assert replay.index('logf("vk: FATAL:') < replay.index("std::_Exit(3)")
     assert 'strstr(buf, "VK_ERROR_DEVICE_LOST") ? "device lost"' in threads
     logger = block(threads, "static void hos_vlog(")
-    assert logger.index("hos_crash_record_fatal(") < logger.index("snprintf(line,")
+    assert logger.index("hos_crash_record_fatal(") < logger.index("snprintf(raw,")
+    # (the line without the player's user name before anything has it: host/log_redact.h)
+    assert logger.index("snprintf(raw,") < logger.index("hos_log_redact(line, sizeof line, raw);") < logger.index("log_queue(line)")
+    assert "hos_log_redact(clean, sizeof clean, buf);" in fatal
     for marker in ("void hos_log(", "void hos_log_at("):
         wrapper = block(threads, marker)
         assert "hos_vlog(" in wrapper and "hos_crash_record_fatal(" not in wrapper
@@ -127,7 +130,8 @@ def build(cc, temp, glue, threads, main):
         "RECORD_EXCEPTION": block(glue, "static void record_exception("),
         "FATAL_ADAPTER": block(glue, "void hos_crash_record_fatal("),
         "REPORT_FATAL": block(glue, "static LONG CALLBACK report_fatal("),
-        "HOS_LOG": "\n".join((levels, block(threads, "static const char *log_level_tag("),
+        "HOS_LOG": "\n".join((levels, "static long long log_qpc_now(void) { return -1; }   /* (HOS_LOG_QPC unset: no stamp) */",
+                               block(threads, "static const char *log_level_tag("),
                                block(threads, "static void hos_vlog("), block(threads, "void hos_log("),
                                block(threads, "void hos_log_at("))),
         "HOS_FATAL": block(threads, "void hos_fatal("),
@@ -242,7 +246,7 @@ def main():
                 if mode == "device-early-tagged":
                     assert "[warn] vk: device lost: reading the checkpoints" in result.stderr
             if mode == "signal" and os.name != "nt":
-                assert values["signal"] == str(signal.SIGSEGV)
+                assert int(values["signal"]) == int(signal.SIGSEGV), values   # (str() of the enum is "Signals.SIGSEGV" before Python 3.11)
                 assert int(values["signal_code"]) <= 0
             if mode == "crash" and os.name != "nt":
                 assert values["signal_code"] == "1"  # SEGV_MAPERR: the authored 0x40 fault, not SI_TKILL

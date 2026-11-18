@@ -178,7 +178,7 @@ public partial class MainWindow : Window
     }
 
     // ================= what the button does: build, update the game, play it, or get the newer builder =================
-    // (as NX2navi's launcher: whatever version the player opens, it checks the latest release and says what is there)
+    // (as a game launcher does: whatever version the player opens, it checks the latest release and says what is there)
 
     enum Mode { Build, UpdateGame, UpToDate, UpdateBuilder }
     Mode mode = Mode.Build;

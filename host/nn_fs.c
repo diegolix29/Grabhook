@@ -19,8 +19,8 @@
 /* (hookshot, #1468) A game folder whose deepest file passes 260 characters (MAX_PATH: "E:\Games\...\romfs\Event\EventSetting\
    Ev..." at 262) is read too. The host paths here are up to HOS_FS_PATH bytes, and on Windows each file call goes through
    its wide function: the path converted from the game's UTF-8 strings and, when it is
-   long and absolute, given the extended-length prefix \\?\ (with its / made \), which Windows takes without its long-paths
-   setting. Short paths are as they were. */
+   long and absolute, given the extended-length prefix \\?\ (with its / made \ and a doubled separator made one), which
+   Windows takes without its long-paths setting. Short paths are as they were. */
 #define HOS_FS_PATH 1024
 #ifdef _WIN32
 static const wchar_t *fs_wide(const char *p, wchar_t *w, size_t cap) {
@@ -36,9 +36,19 @@ static const wchar_t *fs_wide(const char *p, wchar_t *w, size_t cap) {
         if (unc) p++;   /* (\\server\share -> \\?\UNC\server\share) */
     }
     if (MultiByteToWideChar(CP_UTF8, 0, p, -1, w + at, (int)(cap - at)) <= 0) w[0] = 0;
-    if (extended)
-        for (wchar_t *q = w; *q; q++)
-            if (*q == L'/') *q = L'\\';
+    if (extended) {
+        /* (under the prefix Windows takes a path as it is: a / is no separator, and a doubled one is an invalid name
+           (ERROR_INVALID_NAME), where a short path has both tidied. The game doubles one itself, in its streamed
+           voices' "Voice/Resource//Stream/...": in a game folder long enough their files were "not found" and the
+           cutscenes silent. So here every / is a \, and a run of them one) */
+        wchar_t *d = w + at;
+        for (const wchar_t *q = w + at; *q; q++) {
+            const wchar_t c = *q == L'/' ? L'\\' : *q;
+            if (c == L'\\' && d > w + at && d[-1] == L'\\') continue;
+            *d++ = c;
+        }
+        *d = 0;
+    }
     return w;
 }
 #define FS_W(p) fs_wide((p), (wchar_t[HOS_FS_PATH + 8]){0}, HOS_FS_PATH + 8)
@@ -122,14 +132,32 @@ static int mount(const char *name, const char *root, int writable) {   /* 0: the
            Product.111): a game that died in its first second gave no other trace of the files it read */
         char pattern[MAX_PATH];
         WIN32_FIND_DATAA fd;
-        snprintf(pattern, sizeof pattern, "%s\\System\\Resource\\ResourceSizeTable*", root);
-        HANDLE f = FindFirstFileA(pattern, &fd);
         /* (hookshot) and said to the player: the game reads that table first and dies in its first second without it
            (a null from its allocator), and a romfs from another PC port's install (a few packed .bin files) had none. Not
            stopped here: only said, the game goes on as before */
         const char *expected = "ResourceSizeTable.Product.111.Nin_Ounce_NVN2.rsizetable.zs";
+        /* (hookshot) The supported version's table is looked for by its own name first. The folder's first
+           ResourceSizeTable file was taken as the version: a dump of the updated game that keeps the first version's table
+           beside the update's (Product.100 sorts before Product.111) was called another version at every start, with the
+           right files in it. Another version's table beside the supported one is only noted in the log */
+        WIN32_FIND_DATAA other;
+        int found = 0, others = 0;   /* (found: fd holds a table, the supported one when it is there) */
+        snprintf(pattern, sizeof pattern, "%s\\System\\Resource\\%s", root, expected);
+        HANDLE f = FindFirstFileA(pattern, &fd);
+        if (f != INVALID_HANDLE_VALUE) found = 1, FindClose(f);
+        snprintf(pattern, sizeof pattern, "%s\\System\\Resource\\ResourceSizeTable*", root);
+        f = FindFirstFileA(pattern, &other);
+        if (f != INVALID_HANDLE_VALUE) {
+            do {
+                if (!_stricmp(other.cFileName, expected)) continue;
+                if (!found) { fd = other, found = 2; break; }   /* (no supported table: the first other one is the version) */
+                if (others++ < 4)
+                    hos_log("fs: another version's table is beside the supported one and is not read: %s", other.cFileName);
+            } while (FindNextFileA(f, &other));
+            FindClose(f);
+        }
         char text[1024] = "";
-        if (f == INVALID_HANDLE_VALUE) {
+        if (!found) {
             hos_log("fs: the RomFS has no System\\Resource\\ResourceSizeTable file: the game files are incomplete");
             snprintf(text, sizeof text, "The game files in %s are not the game's own RomFS: its System\\Resource folder has no "
                      "ResourceSizeTable file, and the game will most likely close at once.\n\nA romfs folder taken from another PC "
@@ -137,8 +165,7 @@ static int mount(const char *name, const char *root, int writable) {   /* 0: the
                      "of the game (the .nup file, or the romfs and exefs folders dumped from it).", root);
         } else {
             hos_log("fs: RomFS resource table %s (%lu bytes)", fd.cFileName, (unsigned long)fd.nFileSizeLow);
-            FindClose(f);
-            if (_stricmp(fd.cFileName, expected)) {
+            if (found == 2) {
                 hos_log("fs: that is not the supported version's (%s): the game files are from another version", expected);
                 snprintf(text, sizeof text, "The game files in %s are from another version of the game (%s; Hookshot supports the "
                          "one with %s), and the game may close or misbehave.\n\nInstall again from a dump of the game with its "
@@ -268,14 +295,22 @@ static void free_handle(uint64_t id) {
     ReleaseSRWLockExclusive(&handle_lock);
 }
 
-/* (hookshot) Whether the game is writing a file now: one is open for writing and was written in the last second.
-   The game's Commit is nothing here, so a save goes straight into its files; closing the window (or the Insert menu's Quit
-   game) waits for such a write to end before the process exits (host/hos_relaunch.c) */
-static volatile LONG writes_open;
-static volatile LONG64 last_write_ns;
-static void wrote_now(void) { InterlockedExchange64(&last_write_ns, hos_now_ns()); }
-int hos_fs_writing(void) {
-    return writes_open > 0 && hos_now_ns() - InterlockedExchangeAdd64(&last_write_ns, 0) < 1000000000LL;
+/* (hookshot) Whether the game is writing a file now: one is open for writing and
+   was written in the last second. Commit is nothing here, so a save goes straight into its files; every close
+   (hos_relaunch.c hos_close_finish) waits up to 3 s for such a write to end before the process exits. The game's threads
+   go on meanwhile */
+static int writes_open;
+static int64_t last_write_ns;
+static void wrote_now(void) { __atomic_store_n(&last_write_ns, hos_now_ns(), __ATOMIC_RELAXED); }
+static int fs_writing(void) {
+    return __atomic_load_n(&writes_open, __ATOMIC_RELAXED) > 0 &&
+           hos_now_ns() - __atomic_load_n(&last_write_ns, __ATOMIC_RELAXED) < 1000000000LL;
+}
+void hos_fs_wait_writes(void) {
+    const int64_t t0 = hos_now_ns();
+    int waited = 0;
+    while (fs_writing() && hos_now_ns() - t0 < 3000000000LL) waited = 1, hos_sleep_ns(10000000);
+    if (waited) hos_log("stop: the game was writing a file: waited %.0f ms for it", (double)(hos_now_ns() - t0) / 1e6);
 }
 
 /* ---- mounts --------------------------------------------------------------------------------------------------- */
@@ -463,7 +498,7 @@ HLE(_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci) {
     Handle *fh = (Handle *)calloc(1, sizeof *fh);
     fh->h = h;
     fh->writable = want_write;
-    if (want_write) InterlockedIncrement(&writes_open);
+    if (want_write) __atomic_add_fetch(&writes_open, 1, __ATOMIC_RELAXED);
     snprintf(fh->path, sizeof fh->path, "%s", g);
     G64(ARG(0)) = new_handle(fh);
     if (hos_trace || fs_trace()) hos_log("fs: OpenFile(%s)", g);
@@ -555,7 +590,9 @@ HLE(_ZN2nn2fs9WriteFileENS0_10FileHandleElPKvmRKNS0_11WriteOptionE) {
             return;
         }
         wrote_now();
+        const int away = hos_vcore_away();   /* (as the reads: a write can wait for the disk, the dirty pages' writeback) */
         WriteFile(fh->h, GP(ARG(2)), (DWORD)ARG(3), &put, &ov);
+        if (away) hos_vcore_back();
         wrote_now();
     }
     RET(put == ARG(3) ? 0 : 0x2EE202);
@@ -569,11 +606,19 @@ HLE(_ZN2nn2fs11SetFileSizeENS0_10FileHandleEl) {
     SetEndOfFile(fh->h);
     RET(0);
 }
-HLE(_ZN2nn2fs9FlushFileENS0_10FileHandleE) { FlushFileBuffers(get_handle(c, ARG(0))->h); RET(0); }
+/* (the save's flush is an fdatasync on Linux, FlushFileBuffers on Windows: tens of ms or more on a busy disk, no core
+   held meanwhile) */
+HLE(_ZN2nn2fs9FlushFileENS0_10FileHandleE) {
+    Handle *fh = get_handle(c, ARG(0));
+    const int away = hos_vcore_away();
+    FlushFileBuffers(fh->h);
+    if (away) hos_vcore_back();
+    RET(0);
+}
 HLE(_ZN2nn2fs9CloseFileENS0_10FileHandleE) {
     Handle *fh = get_handle(c, ARG(0));
     CloseHandle(fh->h);
-    if (fh->writable) InterlockedExchangeAdd(&writes_open, -1);
+    if (fh->writable) __atomic_sub_fetch(&writes_open, 1, __ATOMIC_RELAXED);
     free_handle(ARG(0));
     free(fh);
 }

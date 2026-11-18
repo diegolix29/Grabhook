@@ -142,6 +142,7 @@ Id TypeId(const EmitContext& ctx, IR::Type type) {
 
 void Traverse(EmitContext& ctx, IR::Program& program) {
     IR::Block* current_block{};
+    bool prologue_done{};
     // (EvilOOT, RX_VK_BLOCK_PROBE=1 with RX_VK_MISS_LOG=1 and RX_VK_MISS_LOG_PROG=<key>: each block's entries counted, by
     // invocation, in the miss log's words 128 + the block's index in program.blocks: IR::DumpProgram's "Block $n")
     static const bool probe_env{std::getenv("RX_VK_BLOCK_PROBE") != nullptr};
@@ -159,6 +160,7 @@ void Traverse(EmitContext& ctx, IR::Program& program) {
             }
             current_block = node.data.block;
             ctx.AddLabel(label);
+            if (!prologue_done) prologue_done = true, ctx.EmitEntryPrologue();   // (RX_VK_MESH_G3: before the first instruction)
             bool probed{!probe};
             for (IR::Inst& inst : node.data.block->Instructions()) {
                 if (!probed && inst.GetOpcode() != IR::Opcode::Phi) {   // (after the phis: they must lead the block)

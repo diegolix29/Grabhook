@@ -283,6 +283,8 @@ def cpp_checks(tools, timeout):
     out.append((regmap, build_and_run(regmap, ["-O1", "-Wno-everything", "-I" + eden, "-I" + compat], [])))
     ldsm = "gpu/vk/tests/ldsm_address_test.cpp"   # (LDSM's row addresses kept apart from its shuffles' registers)
     out.append((ldsm, build_and_run(ldsm, ["-O1", "-Wno-everything", "-I" + eden, "-I" + compat], [])))
+    push = "gpu/vk/tests/push_fix_test.cpp"   # (the fallback task modules' push-constant accesses by byte offset: vk_push_fix.h)
+    out.append((push, build_and_run(push, ["-O1", "-Wall", "-Wextra", "-I" + os.path.join(ROOT, "gpu", "vk")], [])))
     return out, ([] if cxx else ["a C++ compiler"])
 
 

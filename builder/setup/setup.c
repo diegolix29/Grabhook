@@ -577,7 +577,7 @@ static void write_parts(const wchar_t *install, const Part *parts, int nparts) {
     CloseHandle(f);
 }
 
-/* (as NX2navi's launcher keeps them: the version just installed and the one before it stay, older versions go, and so do downloads
+/* (as a game launcher keeps them: the version just installed and the one before it stay, older versions go, and so do downloads
    the list no longer names; a part unchanged since the last release keeps its checksum and stays cached) */
 static void prune(const wchar_t *versions, const wchar_t *downloads, const char *tag, const Part *parts, int nparts) {
     wchar_t cur[MAX_PATH], prev[MAX_PATH], pat[MAX_PATH], p[MAX_PATH];

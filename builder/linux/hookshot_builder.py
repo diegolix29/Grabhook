@@ -1084,9 +1084,9 @@ class Builder(tk.Tk):
             doc = self.saves_tool("list")
             found = []
             for source in doc.get("sources", []):
-                programs = [n for n in source["display"].split(" / ") if n != "NX2navi"]
-                # (emulators that share one save folder, Eden's forks: one row, its programs said under it; one port unnamed)
-                shown = ("another PC port" if source["name"] == "nx2navi" else "your emulator's save" if len(programs) > 1
+                programs = [n for n in source["display"].split(" / ") if n != "another PC port"]
+                # (emulators that share one save folder, Eden's forks: one row, its programs said under it; the other port by what it is)
+                shown = ("another PC port" if source["name"] == "pcport" else "your emulator's save" if len(programs) > 1
                          else programs[0])
                 who = "%s and %s keep their saves here · " % (", ".join(programs[:-1]), programs[-1]) if len(programs) > 1 else ""
                 for save in source["saves"]:

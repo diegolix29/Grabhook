@@ -48,6 +48,8 @@ import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)   # (python -I leaves the script folder off)
+import long_paths  # noqa: E402
+long_paths.install()   # (paths past 260 characters on Windows, before anything reads a file)
 from prompt_faces import FACES, override, parts   # noqa: E402 (the faces: their icons, drawings and their parts)
 import prompt_keys   # noqa: E402 (the keyboard face)
 KENNEY = os.path.join(os.path.dirname(HERE), "third_party", "kenney_input")
@@ -1070,7 +1072,7 @@ def prompt_key(a):
     """Everything generate() reads; keep this list with its file opens/imports and tests/test_prompt_skip.py. Also the
     game's side (host/prompts.c makes the runtime files from these, under keys of its own that don't cover its code), and a
     packaged builder's release: each builder update draws them again once, whatever this list misses"""
-    source = {n: prompt_file(os.path.join(HERE, n)) for n in ("prompt_assets.py", "prompt_draw.py")}
+    source = {n: prompt_file(os.path.join(HERE, n)) for n in ("prompt_assets.py", "prompt_draw.py", "pause_layout.py")}   # (pause_layout: the pause menu's Recomp options button)
     source["host/prompts.c"] = prompt_file(os.path.join(os.path.dirname(HERE), "host", "prompts.c"))
     tables = {n: prompt_file(os.path.join(HERE, n)) for n in ("prompt_faces.py", "prompt_keys.py")}
     fonts = {FONT: prompt_file(os.path.join(a.romfs, FONT))}

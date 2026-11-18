@@ -18,6 +18,7 @@
 #include "common/common_types.h"
 #include "common/div_ceil.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
+#include "shader_recompiler/backend/spirv/global_helper_policy.h"
 #include "shader_recompiler/backend/spirv/mma_layout.h"
 #include "shader_recompiler/backend/spirv/spirv_emit_context.h"
 #ifndef HOOKSHOT_ENV_H   // (env_on: the switches' one rule)
@@ -593,6 +594,9 @@ EmitContext::EmitContext(const Profile& profile_, const RuntimeInfo& runtime_inf
     DefineImages(program.info, image_binding, bindings.image_scaling_index);
     DefineAttributeMemAccess(program.info);
     DefineWriteStorageCasLoopFunction(program.info);
+    for (const IR::Block* const block : program.blocks) {
+        ir_instruction_count += static_cast<u32>(block->size());
+    }
     DefineGlobalMemoryFunctions(program.info);
     DefineRescalingInput(program.info);
     DefineRenderArea(program.info);
@@ -700,7 +704,7 @@ void EmitContext::DefineLocalMemory(const IR::Program& program) {
     const Id element_type{TypeStruct(U32[1])};
     const Id type{TypeArray(element_type, Const(num_elements))};
     const Id pointer{TypePointer(spv::StorageClass::Private, type)};
-    // (NX2navi ee6fbaf, maxwell.md 3.12) Local memory read before the shader writes it: the game's code finds 0 there on the
+    // (maxwell.md 3.12) Local memory read before the shader writes it: the game's code finds 0 there on the
     // Switch; a Private array with no initializer is undefined, and NVIDIA's driver hands such a read another warp lane's
     // values (Ocarina's clustered-light loop then added other pixels' light: objects lit neon, floors in 4x8 tiles). It
     // starts at zero now. EDEN_NX2_LOCAL_ZERO=0: no initializer (the old behaviour)
@@ -1082,16 +1086,13 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
     // memory: here a page table (vk_memory.cpp) takes the guest address to its pool's device address.
     const char* const gp_test{getenv("RX_VK_GP_TEST")};   // (1: the addressing model alone, 2: and the table's load, 3 or unset: all of it)
     const int gp_level{gp_test ? atoi(gp_test) : 3};
-    // (the culling; a graphics stage with it hung the renderer at a load. RX_VK_NO_FOLLOW: none of it, as before)
-    static const bool no_follow{env_on("RX_VK_NO_FOLLOW")};
+    // (the culling; a graphics stage with it hung the renderer at a load)
     // (not the task and mesh stages: tried for the foliage, which it did not bring back)
     // (EvilOOT: vertex and fragment stages too, as the fallback only: an access no bound buffer holds read 0 there (Kokiri's
     // pond came out grey, not green). The pointer pass leaves graphics stages as they were, so what was found before still is,
-    // and the menus' text stays. Not where the stage has the render area's push block: a stage has one push block.
-    // RX_VK_FOLLOW_GRAPHICS=0: off)
-    static const bool graphics{!getenv("RX_VK_FOLLOW_GRAPHICS") || atoi(getenv("RX_VK_FOLLOW_GRAPHICS")) != 0};
+    // and the menus' text stays. Not where the stage has the render area's push block: a stage has one push block)
     const bool graphics_stage{stage == Stage::VertexB || stage == Stage::Fragment};
-    const bool follow_pointers{(stage == Stage::Compute || (graphics && graphics_stage && !info.uses_render_area)) && !no_follow};
+    const bool follow_pointers{stage == Stage::Compute || (graphics_stage && !info.uses_render_area)};
     Id ptr_u64{};
     if (follow_pointers) {
         wants_guest_pages = true;
@@ -1213,6 +1214,80 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
         OpBranch(end_label);
         AddLabel(end_label);
     }};
+    // (RX_VK_MESH_G3=1, task and mesh stages, off by default: a name under RX_VK_MESH, so the program cache starts again with it) The
+    // search below worked each candidate's range out again at every global access, and a mesh program has ~80 of them inlined: two
+    // loads, an ArrayLength and a dozen 64-bit operations a candidate, 40% of the code of OoT's 225k-word mesh shader, which NVIDIA runs
+    // from the instruction cache's edge (1.1 ms of 1.5 ms came back with the helpers not inlined). Here a range (its aligned base, its
+    // length in bytes) is made once, in the first block, and an access is a subtraction and a comparison.
+    static const bool g3_hoist{getenv("RX_VK_MESH_G3") != nullptr && atoi(getenv("RX_VK_MESH_G3")) != 0};
+    // (RX_VK_MESH_NOINLINE_ABOVE=n, off by default: a mesh stage of more than n IR instructions keeps its helpers out of line and
+    // its ranges unhoisted, global_helper_policy.h)
+    static const u32 noinline_above{NoInlineAbove(getenv("RX_VK_MESH_NOINLINE_ABOVE"))};
+    const bool big_mesh{LeaveHelpersOutOfLine(stage == Stage::Mesh, ir_instruction_count, noinline_above)};
+    if (noinline_above != 0 && stage == Stage::Mesh) {
+        LOG_WARNING(Shader_SPIRV, "mesh stage of {} IR instructions: helpers {} (RX_VK_MESH_NOINLINE_ABOVE {})", ir_instruction_count,
+                    big_mesh ? "out of line" : "as before", noinline_above);
+    }
+    const bool hoist{g3_hoist && !big_mesh && (stage == Stage::Task || stage == Stage::Mesh) && Sirit::ValidId(storage_types.U32.array)};
+    struct Range { Id lo, len; };
+    std::map<std::pair<size_t, u32>, Range> ranges;   // (a plain buffer: (index, 0); a table's entry: (table + 100000, k))
+    const u64 align_mask_all{~(profile.min_ssbo_alignment - 1U)};
+    const auto make_range{[&](size_t key_a, u32 key_b, auto&& compute) {   // (compute: -> (lo u64, len u64), in the first block)
+        const Id lo_var{AddGlobalVariable(TypePointer(spv::StorageClass::Private, U64), spv::StorageClass::Private)};
+        const Id len_var{AddGlobalVariable(TypePointer(spv::StorageClass::Private, U32[1]), spv::StorageClass::Private)};
+        interfaces.push_back(lo_var);
+        interfaces.push_back(len_var);
+        ranges[{key_a, key_b}] = {lo_var, len_var};
+        entry_emitters.push_back([this, lo_var, len_var, compute] {
+            const auto [lo, len] = compute();
+            OpStore(lo_var, lo);
+            OpStore(len_var, OpSelect(U32[1], OpUGreaterThan(U1, len, Constant(U64, u64{0xFFFFFFFFu})), Const(0xFFFFFFFFu),
+                                      OpUConvert(U32[1], len)));
+        });
+    }};
+    if (hoist) {
+        for (size_t index = 0; index < info.storage_buffers_descriptors.size(); ++index) {
+            const auto& ssbo{info.storage_buffers_descriptors[index]};
+            if (index == miss_index || ssbo.count != 1 || info.native_global_bounds || !Sirit::ValidId(ssbos[index].U32)) continue;
+            make_range(index, 0, [this, ssbo, index, align_mask_all] {
+                const Id words_pointer{OpAccessChain(uniform_types.U32x2, cbufs[ssbo.cbuf_index].U32x2, u32_zero_value,
+                                                     Const(ssbo.cbuf_offset / 8))};
+                const Id size_pointer{OpAccessChain(uniform_types.U32, cbufs[ssbo.cbuf_index].U32, u32_zero_value,
+                                                    Const(ssbo.cbuf_offset / 4 + 2))};
+                const Id unaligned{OpBitcast(U64, OpLoad(U32[2], words_pointer))};
+                const Id lo{OpBitwiseAnd(U64, unaligned, Constant(U64, align_mask_all))};
+                const Id size{OpUConvert(U64, OpLoad(U32[1], size_pointer))};
+                const Id from_size{OpISub(U64, OpIAdd(U64, unaligned, size), lo)};
+                const Id bound{OpUConvert(U64, OpShiftLeftLogical(U32[1], OpArrayLength(U32[1], ssbos[index].U32, 0U), Const(2U)))};
+                return std::make_pair(lo, OpSelect(U64, OpULessThan(U1, bound, from_size), bound, from_size));
+            });
+        }
+        for (size_t t = 0; t < ssbo_tables.size(); ++t) {
+            const GlobalTableVars& table{ssbo_tables[t]};
+            if (!Sirit::ValidId(table.vars.U32) || !Sirit::ValidId(cbufs[table.cbuf_index].U32x2)) continue;
+            for (u32 k = 0; k < table.count; ++k) {
+                make_range(100000 + t, k, [this, table, k, align_mask_all] {
+                    const u32 at{table.cbuf_offset + k * 16};
+                    const Id entry_pointer{OpAccessChain(uniform_types.U32x2, cbufs[table.cbuf_index].U32x2, u32_zero_value, Const(at / 8))};
+                    const Id size_pointer{OpAccessChain(uniform_types.U32x2, cbufs[table.cbuf_index].U32x2, u32_zero_value, Const(at / 8 + 1))};
+                    const Id unaligned{OpBitcast(U64, OpLoad(U32[2], entry_pointer))};
+                    const Id lo{OpBitwiseAnd(U64, unaligned, Constant(U64, align_mask_all))};
+                    const Id size_word{OpCompositeExtract(U32[1], OpLoad(U32[2], size_pointer), 0U)};
+                    const Id from_size{OpISub(U64, OpIAdd(U64, unaligned, OpUConvert(U64, size_word)), lo)};
+                    const Id bound{OpUConvert(U64, OpShiftLeftLogical(
+                        U32[1], OpArrayLength(U32[1], OpAccessChain(storage_types.U32.array, table.vars.U32, Const(k)), 0U), Const(2U)))};
+                    const Id capped{OpSelect(U64, OpULessThan(U1, bound, from_size), bound, from_size)};
+                    return std::make_pair(lo, OpSelect(U64, OpIEqual(U1, size_word, u32_zero_value), bound, capped));
+                });
+            }
+        }
+    }
+    // (the range test of a hoisted candidate: (addr - lo) < length, the length cut to what a member of 1 << shift bytes holds)
+    const auto hoisted_hit{[&](const Range& r, Id addr, u32 shift) {
+        Id len{OpUConvert(U64, OpLoad(U32[1], r.len))};
+        if (shift > 2) len = OpBitwiseAnd(U64, len, Constant(U64, ~u64{(1u << shift) - 1}));
+        return OpULessThan(U1, OpISub(U64, addr, OpLoad(U64, r.lo)), len);
+    }};
     const auto define_body{[&](DefPtr ssbo_member, Id addr, Id element_pointer, u32 shift,
                                auto&& callback, bool add_label = true) {
         if (add_label) AddLabel();
@@ -1280,6 +1355,19 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
             // so searching a buffer the access never falls in costs a comparison and nothing else.
             if (info.storage_buffers_descriptors[index].count > 1 ||
                 !Sirit::ValidId(ssbos[index].*ssbo_member)) {
+                continue;
+            }
+            if (const auto hit{ranges.find({index, 0})}; hit != ranges.end() && Sirit::ValidId(ssbos[index].*ssbo_member)) {
+                const Id lo{OpLoad(U64, hit->second.lo)};
+                const Id cond{hoisted_hit(hit->second, addr, shift)};
+                const Id then_label{OpLabel()};
+                const Id else_label{OpLabel()};
+                OpSelectionMerge(else_label, spv::SelectionControlMask::MaskNone);
+                OpBranchConditional(cond, then_label, else_label);
+                AddLabel(then_label);
+                const Id ssbo_index{OpShiftRightLogical(U32[1], OpUConvert(U32[1], OpISub(U64, addr, lo)), Const(shift))};
+                callback(OpAccessChain(element_pointer, ssbos[index].*ssbo_member, zero, ssbo_index));
+                AddLabel(else_label);
                 continue;
             }
             const auto& ssbo{info.storage_buffers_descriptors[index]};
@@ -1375,6 +1463,19 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
                 continue;
             }
             for (u32 k = 0; k < table.count; ++k) {
+                if (const auto hit{ranges.find({static_cast<size_t>(&table - ssbo_tables.data()) + 100000, k})}; hit != ranges.end()) {
+                    const Id lo{OpLoad(U64, hit->second.lo)};
+                    const Id cond{hoisted_hit(hit->second, addr, shift)};
+                    const Id then_label{OpLabel()};
+                    const Id else_label{OpLabel()};
+                    OpSelectionMerge(else_label, spv::SelectionControlMask::MaskNone);
+                    OpBranchConditional(cond, then_label, else_label);
+                    AddLabel(then_label);
+                    const Id ssbo_index{OpShiftRightLogical(U32[1], OpUConvert(U32[1], OpISub(U64, addr, lo)), Const(shift))};
+                    callback(OpAccessChain(element_pointer, table_id, Const(k), zero, ssbo_index));
+                    AddLabel(else_label);
+                    continue;
+                }
                 const u32 at{table.cbuf_offset + k * 16};
                 const Id entry_pointer{OpAccessChain(uniform_types.U32x2, cbufs[table.cbuf_index].U32x2, zero,
                                                      Const(at / 8))};
@@ -1434,9 +1535,13 @@ void EmitContext::DefineGlobalMemoryFunctions(const Info& info) {
         // the wall of trees in the sky. The culling's compute programs, with hundreds of global loads, keep the helper
         // (NVIDIA took 41 s on one inlined, above)
         static const bool gm_inline{!getenv("EDEN_NX2_GM_INLINE") || getenv("EDEN_NX2_GM_INLINE")[0] != '0'};
+        // (RX_VK_MESH_NOINLINE=task|mesh|both, diagnosis, off by default: those stages' helpers not inlined; the stamp has it)
+        static const char* const noinline_env{getenv("RX_VK_MESH_NOINLINE")};
+        const bool noinline_here{big_mesh || (noinline_env && ((stage == Stage::Task && (strstr(noinline_env, "task") || strstr(noinline_env, "both"))) ||
+                                                   (stage == Stage::Mesh && (strstr(noinline_env, "mesh") || strstr(noinline_env, "both")))))};
         const bool inline_here{gm_inline && (stage == Stage::Task || stage == Stage::Mesh ||
                                             (shift == 4 && runtime_info.inline_global_128_loads))};
-        const Id func_id{OpFunction(type, inline_here ? spv::FunctionControlMask::Inline : spv::FunctionControlMask::DontInline,
+        const Id func_id{OpFunction(type, inline_here && !noinline_here ? spv::FunctionControlMask::Inline : spv::FunctionControlMask::DontInline,
                                     function_type)};
         const Id addr{OpFunctionParameter(U64)};
         define_body(ssbo_member, addr, element_pointer, shift,
@@ -2539,8 +2644,8 @@ void EmitContext::DefineMesh(const IR::Program& program) {
         mesh_vertex_targets.push_back(target(line, false));
     }
     // (hookshot) A component of a generic output no line writes was undefined at the fragment stage (the console's: 0, and 1 for .w,
-    // as the vertex stage's defaults here). The foliage is drawn by mesh programs: neon plants. RX_VK_MESH_NO_DEFAULTS=1: as before
-    if (!env_on("RX_VK_MESH_NO_DEFAULTS")) {
+    // as the vertex stage's defaults here). The foliage is drawn by mesh programs: neon plants
+    {
         std::array<u32, IR::NUM_GENERICS> written{};
         for (const u32 line : mesh_info.vertex_lines) {
             const IR::Attribute attribute{line};

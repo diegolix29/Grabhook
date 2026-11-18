@@ -46,6 +46,9 @@ def test_route():
     check("gpu/render (the op stream host/ includes) builds the game", r(["gpu/render/x.h"]) == "game")
     check("a build script builds the game", r(["nx2/build.py"]) == "game")
     check("docs and tests build nothing", r(["docs/development.md", "tests/test_a.py", "README.md"]) is None)
+    check("a renderer shader and its generated header build the renderer alone (only the renderer is kept)",
+          r(["gpu/vk/shaders/fg_copy.comp", "gpu/vk/shaders/fg_copy_comp_spv.h"]) == "renderer")
+    check("the forge's workflows build nothing", r([".forgejo/workflows/ci.yml", ".forgejo/pull_request_template.md"]) is None)
     check("an unknown path builds the game", r(["somewhere/new.c"]) == "game")
 
 
@@ -91,10 +94,17 @@ def test_stamped_objects_match_build():
 
 
 def test_caches_named_in_renderer():
-    text = "".join(p.read_text(encoding="utf-8", errors="replace") for p in (ROOT / "gpu" / "vk").glob("*.cpp"))
+    text = "".join(p.read_text(encoding="utf-8", errors="replace") for g in ("*.cpp", "*.h") for p in (ROOT / "gpu" / "vk").glob(g))
     for c in packs.CACHES + (packs.SEED,):
-        check("the renderer still names %s" % c.replace(".predicted", ""), c.replace(".predicted", "") in text)
-    check("the predicted notes' suffix", '".predicted"' in text)
+        # (some are a named file with a suffix the renderer adds: .predicted and .built to the notes, .idx for .bin)
+        name = c.replace(".predicted_keys", "").replace(".predicted", "").replace(".built", "").replace(".zst.idx", ".zst.bin")
+        check("the renderer still names %s" % name, name in text)
+    check("the predicted and built notes' suffixes, and the index's", all(s in text for s in ('".predicted"', '".predicted_keys"', '".built"', '".idx"')))
+    # (and the other way round: every .bin or .idx the renderer names beside the game is a cache, or one of the two files a
+    # build makes (the shader seed, the shipped state list); a new cache file in the renderer fails here until it is classified)
+    named = set(re.findall(r'"(hookshot_[A-Za-z0-9_.]*\.(?:bin|idx))"', text))
+    unknown = sorted(n for n in named if not packs.is_cache(n) and n not in (packs.SEED, "hookshot_pipeline_states_shipped.bin"))
+    check("every file the renderer keeps beside the game is classified (unknown: %s)" % unknown, not unknown)
 
 
 def test_module_changed(d):
@@ -102,7 +112,7 @@ def test_module_changed(d):
     for build in (base, mine):
         write(build / "obj" / "a.o", b"same a")
         write(build / "obj" / "host_hos_main.o", b"version " + build.name.encode())
-        (build / "objs.rsp").write_text("".join('"%s"\n' % (build / "obj" / n) for n in ("a.o", "host_hos_main.o")))
+        (build / "objs.rsp").write_text("".join('"%s"\n' % (build / "obj" / n) for n in ("a.o", "host_hos_main.o")), encoding="utf-8")
     mc = lambda changed_source=False: packs.module_changed(str(base), str(mine), "objs.rsp", "host_hos_main.o", changed_source)
     check("only the version differs: the base's module", not mc())
     check("the version's own source changed: the pack's", mc(True))
@@ -110,7 +120,7 @@ def test_module_changed(d):
     check("another object differs: the pack's", mc())
     write(mine / "obj" / "a.o", b"same a")
     write(mine / "obj" / "b.o", b"new")
-    (mine / "objs.rsp").write_text("".join('"%s"\n' % (mine / "obj" / n) for n in ("a.o", "b.o", "host_hos_main.o")))
+    (mine / "objs.rsp").write_text("".join('"%s"\n' % (mine / "obj" / n) for n in ("a.o", "b.o", "host_hos_main.o")), encoding="utf-8")
     check("another set of objects: the pack's", mc())
     check("no link list in the base: the pack's", packs.module_changed(str(d / "none"), str(mine), "objs.rsp", "host_hos_main.o", False))
 
@@ -179,8 +189,11 @@ def test_guards(d):
                                                          "--romfs", "r", "--exefs", "e", "--tree", str(ROOT)], "plain game folder")
     refused("a runtime inside the base's game folder", ["rt", str(base), str(base / "game" / "runtime")], "folder of its own")
     check("...and nothing written there", not (base / "game" / "runtime").exists())
-    write(base / "game" / "language.txt", b"# the game's language\nde-DE\n")
-    check("the base's language is read for its packs", packs.game_language(str(base / "game")) == "de-DE")
+    write(base / "game" / "language.txt", b"# the game's language\n  # an indented note\nnot-a-code\nde\n")
+    check("the base's language is read for its packs, as make_game.py reads it (indented comments and unknown lines "
+          "skipped)", packs.game_language(str(base / "game")) == "de")
+    write(base / "game" / "language.txt", b"  # only a note\n")
+    check("no language line: none", packs.game_language(str(base / "game")) is None)
     for name in ("../game", "..", "a/b", str(d)):
         refused("the pack name %r" % name, ["pack", str(base), name, "--tree", str(ROOT)], "pack's name")
     check("the base is still there", (base / "game" / "user" / "save0.bin").exists())
@@ -259,6 +272,13 @@ def test_generated_and_runtime(d):
     check("generated files the build no longer makes are gone; saves, settings and the game's own files are not: %s" % gone,
           gone == ["hookshot_pipeline_states_shipped.bin", "prompts/Common.bntx"])
     check("a base that recorded no outputs (adopted) loses nothing", packs.generated_changes(str(game), str(out))[1] == [])
+    # (a list recorded before caches and the preparation's recovery markers were filtered: a crash mid-prediction leaves one)
+    legacy = outputs + ["mkw_vk_pipelines.stamp", "mkw_vk_pipelines_play_2.bin", "hookshot_pipelines.bin.predicting",
+                        "hookshot_pipelines.bin.running", "hookshot_pipelines.bin.built.warming"]
+    gone = packs.generated_changes(str(game), str(out), legacy)[1]
+    check("an older base's outputs list never deletes a cache or a recovery marker, and still a generated file the build no "
+          "longer makes: %s" % gone,
+          gone == ["hookshot_pipeline_states_shipped.bin", "prompts/Common.bntx"])
     write(out / "stale.bin", b"an earlier pack's")
     packs.clear_output(str(out))
     check("the output folder keeps only romfs for the next build", sorted(os.listdir(out)) == ["romfs"])

@@ -25,7 +25,7 @@ def source_contracts():
     assert 'if (open_now.load()) refresh_outputs();' in tick, 'Refresh on explicit menu opening'
     assert 'r.value != &output_pick' in menu and 'audio_output_device_id=%s' in menu
     assert 'output_forced()' in menu and 'audio_output_device_name' in menu
-    assert '#define MKWVK_API_VERSION 25' in api
+    assert int(re.search(r'#define MKWVK_API_VERSION (\d+)', api).group(1)) >= 26
     assert api.index('int (*take_text)') < api.index('int (*audio_output_count)')
     backend = (ROOT / 'host/rx_backend.c').read_text(encoding='utf-8')
     check_host_callbacks(api, backend)
@@ -33,7 +33,7 @@ def source_contracts():
     assert 'hos_game_path_a' not in devices
     assert re.search(r'\{TAB_AUDIO, "Speaker layout", &opts\.audio_output, 0, 3,', menu)
     assert 'audio_mono(pcm, FRAME, out_channels, rx_option(HOS_OPT_AUDIO_OUTPUT, 0) == 3);' in audio
-    assert '"vk_api.h"' in build and 'HOOKSHOT_SHADER_STAMP' in build
+    assert 'translator_files.stamp(vk)' in build and 'HOOKSHOT_SHADER_STAMP' in build
     assert 'DRV_QUERYFUNCTIONINSTANCEID' in devices and 'calloc(total ? total : 1' in devices
     assert 'waveOutOpen' not in devices and 'SDL_OpenAudio' not in devices
     mixer = audio[audio.index('static DWORD WINAPI renderer_main'):]
@@ -58,9 +58,20 @@ def check_host_callbacks(api, backend):
     expected = {'take_text': 'host_take_text', 'options_path': 'hos_options_file',
                 'audio_output_count': 'hos_audio_output_count', 'audio_output_info': 'hos_audio_output_info',
                 'audio_output_select': 'hos_audio_output_select', 'audio_output_state': 'hos_audio_output_state',
-                'mic_test': 'hos_mic_test'}
+                'mic_test': 'hos_mic_test', 'main_thread_times': 'host_main_thread_times',
+                'out_of_memory': 'host_out_of_memory',
+                'monitor_count': 'hos_monitor_count', 'monitor_info': 'hos_monitor_info',
+                'monitor_select': 'hos_monitor_select'}
     assert len(fields) == len(table), 'Host interface/initializer lengths differ'
-    assert fields[-len(expected):] == list(expected), 'Mic test must follow playback, take_text and options_path'
+    # (the end of the table: playback, the microphone test (28), the frame trace's main_thread_times (29), the renderer's
+    # out_of_memory (30), the fullscreen monitor's three (31), the rumble test (33) and the NFC tab's seven (34); take_text
+    # and options_path come earlier, the mods' and cheats' callbacks between them and playback)
+    tail = ['audio_output_count', 'audio_output_info', 'audio_output_select', 'audio_output_state', 'mic_test',
+            'main_thread_times', 'out_of_memory', 'monitor_count', 'monitor_info', 'monitor_select', 'rumble_test',
+            'nfc_count', 'nfc_name', 'nfc_tap', 'nfc_state', 'nfc_dir', 'nfc_scan', 'nfc_scan_name']
+    assert fields[-len(tail):] == tail, 'Mic test must follow playback (29 appends main_thread_times, 30 out_of_memory, 31 the monitor callbacks, 33 the rumble test, 34 NFC)'
+    assert fields.index('take_text') < fields.index('options_path') < fields.index('audio_output_count'), \
+        'take_text and options_path must come before playback'
     for field, value in expected.items():
         assert table[fields.index(field)] == value, 'Wrong host callback slot: ' + field
 
@@ -71,13 +82,22 @@ PARSER = r'''
 #include <stddef.h>
 #include "audio_output_devices.h"
 #include "gpu/vk/vk_api.h"
-_Static_assert(MKWVK_API_VERSION == 25, "microphone test needs a new ABI version");
-_Static_assert(offsetof(MkwVkHost, options_path) == offsetof(MkwVkHost, take_text) + sizeof(((MkwVkHost *)0)->take_text),
-               "keep the version-23 settings path after text input");
-_Static_assert(offsetof(MkwVkHost, audio_output_count) == offsetof(MkwVkHost, options_path) + sizeof(((MkwVkHost *)0)->options_path),
-               "append playback after the existing settings path");
+_Static_assert(MKWVK_API_VERSION >= 31, "fullscreen monitor selection extends the out-of-memory ABI");
+_Static_assert(offsetof(MkwVkHost, options_path) > offsetof(MkwVkHost, take_text), "options_path after take_text");
+_Static_assert(offsetof(MkwVkHost, audio_output_count) > offsetof(MkwVkHost, options_path),
+               "playback after options_path (the mods' and cheats' callbacks between them)");
 _Static_assert(offsetof(MkwVkHost, mic_test) == offsetof(MkwVkHost, audio_output_state) + sizeof(((MkwVkHost *)0)->audio_output_state),
                "append microphone test after playback without shifting earlier callbacks");
+_Static_assert(offsetof(MkwVkHost, main_thread_times) == offsetof(MkwVkHost, mic_test) + sizeof(((MkwVkHost *)0)->mic_test),
+               "append the main thread's times after the microphone test without shifting earlier callbacks");
+_Static_assert(offsetof(MkwVkHost, out_of_memory) == offsetof(MkwVkHost, main_thread_times) + sizeof(((MkwVkHost *)0)->main_thread_times),
+               "append the renderer's out-of-memory stop after the main thread's times without shifting earlier callbacks");
+_Static_assert(offsetof(MkwVkHost, monitor_count) == offsetof(MkwVkHost, out_of_memory) + sizeof(((MkwVkHost *)0)->out_of_memory),
+               "append monitor selection without shifting the out-of-memory callback");
+_Static_assert(offsetof(MkwVkHost, monitor_info) == offsetof(MkwVkHost, monitor_count) + sizeof(((MkwVkHost *)0)->monitor_count),
+               "monitor info slot follows monitor count");
+_Static_assert(offsetof(MkwVkHost, monitor_select) == offsetof(MkwVkHost, monitor_info) + sizeof(((MkwVkHost *)0)->monitor_info),
+               "monitor select slot follows monitor info");
 int main(void) {
     char id[HOS_OUTPUT_ID_CAP] = "old";
     assert(audio_output_copy_id(id, sizeof id, "opaque=id") && !strcmp(id, "opaque=id"));

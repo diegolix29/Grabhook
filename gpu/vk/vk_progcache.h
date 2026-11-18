@@ -93,6 +93,10 @@ std::string program_cache_path();
 
 // (vk_shader.cpp's, for the cache)
 uint64_t translator_stamp();   // (the translator and what it is told: HOOKSHOT_SHADER_STAMP, the GPU, the environment)
+uint64_t translator_build_stamp();   // (the translator and the C++ library alone: the same on every GPU)
+/// (hookshot) cache/ made ready for this GPU's caches at the start, before any is opened: another GPU's set aside, this one's back
+/// (gpu_sets.h). Once a run; RX_VK_NO_GPU_SETS=1: off, another GPU's caches start over as before
+void cache_sets_switch();
 // (program: whose module it is, kept out after a fault in the driver (driver_faults.h); 0: the program vk_shader.cpp translates.
 // busy: on Windows Intel the compiler's gate is only tried (IntelDriverGate): while another thread holds it, *busy is set and
 // no module is made)

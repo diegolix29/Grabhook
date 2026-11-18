@@ -46,7 +46,7 @@ class PromptSkipTests(unittest.TestCase):
         self.romfs = self.root / "romfs"
         self.out = self.root / "game" / "prompts"
         self.out.parent.mkdir()
-        self.source_files = [self.here / n for n in ("prompt_assets.py", "prompt_draw.py", "prompt_faces.py", "prompt_keys.py")]
+        self.source_files = [self.here / n for n in ("prompt_assets.py", "prompt_draw.py", "pause_layout.py", "prompt_faces.py", "prompt_keys.py")]
         self.source_files.append(self.root / "host" / "prompts.c")   # (the game's side: its runtime files are kept with the set)
         self.game_files = [self.romfs / n for n in (P.FONT, P.prompt_keys.LABEL_FONT, "Pack/ZsDic.pack.zs", P.TEXTURES, P.LAYOUTS,
                                                   "System/Resource/ResourceSizeTable.authored.rsizetable.zs")]
@@ -634,7 +634,7 @@ class PromptDependencyTests(unittest.TestCase):
                 P.prompt_packages()
 
     def test_local_imports_and_environment_are_accounted_for(self):
-        sources = {"prompt_assets", "prompt_draw", "prompt_faces", "prompt_keys"}
+        sources = {"prompt_assets", "prompt_draw", "pause_layout", "prompt_faces", "prompt_keys"}
         for name in sources:
             tree = ast.parse((SOURCE / (name + ".py")).read_text(encoding="utf-8"))
             for node in ast.walk(tree):
@@ -642,7 +642,9 @@ class PromptDependencyTests(unittest.TestCase):
                     [node.module] if isinstance(node, ast.ImportFrom) and node.module else []
                 for module in modules:
                     if (SOURCE / (module.split(".")[0] + ".py")).is_file():
-                        self.assertIn(module, sources | {"kit"}, "new prompt dependency needs fingerprint coverage")
+                        # (kit puts the modules on the path; long_paths, #1115, lets a path past 260 characters be opened:
+                        # neither changes what is drawn, so neither is in the prompt key)
+                        self.assertIn(module, sources | {"kit", "long_paths"}, "new prompt dependency needs fingerprint coverage")
         self.assertIn("SOURCE_DATE_EPOCH", P.PROMPT_ENV)
         self.assertIn("FREETYPE_PROPERTIES", P.PROMPT_ENV)
         self.assertIn("archspec", P.PROMPT_PACKAGES)

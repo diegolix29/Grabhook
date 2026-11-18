@@ -37,6 +37,7 @@
 #include "hookshot_env.h"
 #include "fallback_loaded.h"
 #include "fallback_size_policy.h"
+#include "gpu_sets.h"
 #include "vk_paths.h"
 #include "vk_internal.h"
 #include "vk_progcache.h"
@@ -71,6 +72,31 @@ uint64_t program_cache_stamp() {
         return h;
     }();
     return stamp;
+}
+
+void cache_sets_switch() {
+    static std::once_flag once;
+    std::call_once(once, [] {
+        if (env_on("RX_VK_NO_GPU_SETS")) return;
+        uint64_t build = translator_build_stamp();
+        const uint32_t format = kProgramCacheFormat;
+        for (size_t i = 0; i < sizeof format; i++) build = (build ^ ((const uint8_t*)&format)[i]) * 1099511628211ull;
+        const std::string dir = cache_path("");   // (the game folder's cache/, with its separator: vk_paths.h)
+        const gpu_sets::Result r = gpu_sets::switch_to(dir, build, program_cache_stamp(), dev.props.deviceName);
+        using gpu_sets::What;
+        if (r.aside)
+            logf("vk: the shader caches: those of the GPU used before (%016llx) kept aside in cache/%s%016llx: %zu files, %llu MB",
+                 (unsigned long long)r.from, gpu_sets::kAsidePrefix, (unsigned long long)r.from, r.aside,
+                 (unsigned long long)(r.aside_bytes >> 20));
+        if (r.what == What::kRestored)
+            logf("vk: the shader caches: %s's taken back from aside: %zu files, %llu MB", dev.props.deviceName, r.back,
+                 (unsigned long long)(r.back_bytes >> 20));
+        else if (r.what == What::kSetAside)
+            logf("vk: the shader caches: %s's start here (none kept aside for it)", dev.props.deviceName);
+        if (r.dropped_sets)
+            logf("vk: the shader caches: %zu sets aside let go (another build's, or more than %zu: %llu MB)", r.dropped_sets,
+                 gpu_sets::kKeep, (unsigned long long)(r.dropped_bytes >> 20));
+    });
 }
 
 // ---- (hookshot) The program cache, hookshot_programs.bin beside the executable: what translation made, by the key of the
@@ -127,6 +153,7 @@ void idx_write(const std::string& path, uint64_t stamp, const std::vector<std::p
 
 
 void disk_init() {
+    cache_sets_switch();   // (another GPU's caches aside first: gpu_sets.h)
     static std::once_flag once;
     std::call_once(once, [] {
         if (env_on("RX_VK_NO_PROGRAM_CACHE")) return;
@@ -368,7 +395,10 @@ void get_info(Reader& r, Shader::Info& i) {
 void program_cache_save(const Program& p, const std::vector<std::vector<uint32_t>>& spirv) {
     // (each stage's phis, for fallback_compute_pipelines: the SPIR-V is not kept after this. Before the program is published)
     if (spirv.size() == p.stages.size())
-        for (size_t k = 0; k < p.stages.size(); k++) p.stages[k].phis = fallback_size::spirv_phis(spirv[k].data(), spirv[k].size());
+        for (size_t k = 0; k < p.stages.size(); k++) {
+            p.stages[k].phis = fallback_size::spirv_phis(spirv[k].data(), spirv[k].size());
+            p.stages[k].calls = fallback_size::spirv_calls(spirv[k].data(), spirv[k].size());
+        }
     disk_init();
     if (!disk_on || spirv.size() != p.stages.size()) return;
     std::vector<uint8_t> o;
@@ -507,8 +537,9 @@ void program_cache_read(FILE* in, std::mutex* mu, uint64_t key, const std::vecto
                 break;
             }
             st.module = make_module(spirv, key, nullptr);
+            st.spirv_words = (uint32_t)spirv.size();   // (the prediction's size limit, predict_limits.h)
             st.phis = fallback_size::spirv_phis(spirv.data(), spirv.size());
-            st.subgroups = spirv_uses_subgroups(spirv);
+            st.calls = fallback_size::spirv_calls(spirv.data(), spirv.size());
             ok = ok && st.module;
         }
         ok = ok && answers_fit(*p, p->answers);   // (hookshot: an answer past the stages or their slots: not this record)
@@ -632,6 +663,7 @@ bool complete_from(Program& p, FILE* in, std::mutex* mu, bool* busy = nullptr) {
         return false;
     }
     st.phis = fallback_size::spirv_phis(spirv.data(), spirv.size());
+    st.calls = fallback_size::spirv_calls(spirv.data(), spirv.size());
     module_id_learned(p.key, p.variant, st.module);   // (the next run's load makes its pipeline without this read: vk_programs.h)
     return true;
 }
@@ -831,8 +863,7 @@ size_t program_cache_load_some(const std::unordered_set<uint64_t>& wanted, const
     }
     // (and the mesh fallback programs in memory already, whose records an earlier read took: the state lists' programs in the
     // start that prepared the shaders. They had no compute pipelines until their first draw, which was left out: fallback_loaded.h)
-    static const bool loaded_too = fallback_loaded::on(getenv("RX_VK_FALLBACK_LOADED"));
-    if (fallbacks && loaded_too) {
+    if (fallbacks) {
         std::unordered_set<uint64_t> given;
         for (const auto& w : work) given.insert(w.first);
         const size_t loaded = fallback_loaded::each(programs, given, fn);
@@ -842,6 +873,19 @@ size_t program_cache_load_some(const std::unordered_set<uint64_t>& wanted, const
     return n;
 }
 
+/// (hookshot) As program_cache_borrow, every variant of key given to fn at once (alive until fn returns): the preparation's compute
+/// warm hands them to several threads (vk_draw.cpp prepare_run)
+void program_cache_borrow_all(uint64_t key, const std::function<void(std::vector<std::unique_ptr<Program>>&)>& fn) {
+    std::vector<std::unique_ptr<Program>> variants;
+    program_cache_load(key, variants, true);
+    fn(variants);
+    for (auto& p : variants) {
+        for (Stage& st : p->stages)
+            if (st.module) vkDestroyShaderModule(dev.device, st.module, nullptr);
+        if (p->layout) vkDestroyPipelineLayout(dev.device, p->layout, nullptr);
+        if (p->set_layout) vkDestroyDescriptorSetLayout(dev.device, p->set_layout, nullptr);
+    }
+}
 /// (hookshot) Program key's kept variants made for fn, then let go (modules and layouts): the records stay for play
 void program_cache_borrow(uint64_t key, const std::function<void(Program&)>& fn) {
     std::vector<std::unique_ptr<Program>> variants;

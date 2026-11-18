@@ -62,6 +62,7 @@ def section(text, first, before):
 
 FIXTURE = r'''
 #include "gpu/vk/compat/hookshot_env.h"
+#include "gpu/vk/page_marks.h"
 #include <algorithm>
 #include <atomic>
 #include <cstring>
@@ -133,6 +134,7 @@ std::mutex wb_pages_mu;
 @WBPAGES@;
 WbPages wb_pages, wb_parts, wb_direct;
 void (*wb_writers_hook)(uint64_t, uint64_t, uint64_t, uint64_t) = nullptr;   // (RX_VK_LOG_RB_WRITERS: off)
+mkwvk::PageMarks<kPages, kChunkPages> wb_ever;   // (invalidate_quick's marks: wb_pages_note sets them)
 @WBNOTE@
 @SECTION@
 @CAPTURE@;
@@ -657,7 +659,7 @@ def main():
                         + block(text, 'void late_fix_cpu_read(uint32_t page, VkBuffer buffer, uint8_t* slot) {'))
                .replace('@FORGET@', block(text, 'void shadows_forget_written() {')))
     env = {k: v for k, v in os.environ.items()
-           if k not in ('RX_VK_LATE_FIX', 'RX_VK_PARALLEL', 'RX_VK_NO_READBACK_WAIT', 'RX_VK_SHADOW_FOLLOWS_SYNC')}
+           if k not in ('RX_VK_LATE_FIX', 'RX_VK_PARALLEL')}
     with tempfile.TemporaryDirectory(prefix='late-fix-build-') as tmp:
         src = Path(tmp) / 'late_fix_build.cpp'
         exe = Path(tmp) / 'late_fix_build.exe'

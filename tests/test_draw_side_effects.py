@@ -29,6 +29,7 @@ FIXTURE = r"""
 @QUICK_PIPE_H@
 #define PROF_EXACT() ((void)0)
 #define PROF_HOT(x) ((void)0)
+#define FINE_SCOPE(x) ((void)0)   // (RX_VK_PROF_FINE's sections: off here)
 #define SKIP_HERE() return
 using VkPipeline = int;
 struct Desc { bool is_written = false; };
@@ -122,6 +123,9 @@ bool jobs_wait_for(const std::atomic<bool>& ready, double) {
 }
 uint64_t texture_frame_no() { return 1; }
 bool targets_persistent(const Targets& at) { return at.persistent; }
+// (the cases' targets are whole and drawn again each frame: RX_VK_SKIP_PARTS's rule leaves them as before)
+bool targets_redrawn(const Targets& at, const NvnState&) { return at.persistent; }
+bool env_on(const char*) { return false; }
 bool exposure_log_on() { return false; }
 void exposure_note(NvnState&, const Program&) {}
 void ensure_layout(Program&) {}

@@ -86,7 +86,7 @@ class Discovery(Case):
         nx = self.home / "Games" / "Ocarina" / "profile" / "save" / ACCOUNT
         make_save(nx, b"NX")
         expect = {"lichii": self.li, "frizti": self.li, "orchid": self.li, "pokedinner": self.li, "eden": self.li,
-                  "eglantine": eden_save(self.data / "eglantine"), "nx2navi": nx}
+                  "eglantine": eden_save(self.data / "eglantine"), "pcport": nx}
         self.assertEqual(sorted(expect), sorted(p.name for p in oot.EMULATORS))
         for program in oot.EMULATORS:
             folder, found = oot.locate(program, None, "--from")
@@ -96,11 +96,11 @@ class Discovery(Case):
     def test_every_entry_on_windows(self):
         win_li = eden_save(self.appdata / "eden")
         win_eg = eden_save(self.appdata / "eglantine")
-        win_nx = self.localappdata / "Programs" / "NX2navi" / "game" / "profile" / "save" / ACCOUNT
+        win_nx = self.localappdata / "Programs" / "SomePort" / "game" / "profile" / "save" / ACCOUNT
         for folder in (win_li, win_eg, win_nx):
             make_save(folder, b"W")
         expect = {"lichii": win_li, "frizti": win_li, "orchid": win_li, "pokedinner": win_li, "eden": win_li,
-                  "eglantine": win_eg, "nx2navi": win_nx}
+                  "eglantine": win_eg, "pcport": win_nx}
         with mock.patch.object(oot, "WINDOWS", True):
             for program in oot.EMULATORS:
                 self.assertEqual(list(oot.locate(program, None, "--from")[1].values()), [str(expect[program.name])])
@@ -245,7 +245,7 @@ class Discovery(Case):
         make_save(self.home / "Games" / "Ocarina" / "profile" / "save" / ACCOUNT, b"NX")
         code, out, err = self.run_main("list")
         self.assertEqual(code, 0, err)
-        for text in (UID, PROFILE, ACCOUNT, "slot_01", "Lichii / Frizti (Fritchii) / Orchid / PokeDinner / Eden", "NX2navi",
+        for text in (UID, PROFILE, ACCOUNT, "slot_01", "Lichii / Frizti (Fritchii) / Orchid / PokeDinner / Eden", "another PC port",
                      "Eglantine: nothing in"):
             self.assertIn(text, out)
 
@@ -424,7 +424,7 @@ class Copy(Case):
         self.assertEqual(tree(self.li), before)
 
 
-class NX2navi(Case):
+class OtherPort(Case):
     def setUp(self):
         super().setUp()
         self.game = self.home / "Games" / "Ocarina"
@@ -434,11 +434,11 @@ class NX2navi(Case):
         (self.game / "profile" / "save-tx").mkdir()
 
     def test_both_ways(self):
-        code, out, err = self.run_main("import", "nx2navi")
+        code, out, err = self.run_main("import", "pcport")
         self.assertEqual(code, 0, err)
         self.assertEqual(tree(self.hs), tree(self.nx))
         make_save(self.hs / "slot_00", b"Z", slots=())
-        code, out, err = self.run_main("export", "nx2navi", "--to", str(self.game))
+        code, out, err = self.run_main("export", "pcport", "--to", str(self.game))
         self.assertEqual(code, 0, err)
         self.assertEqual(tree(self.nx), tree(self.hs))
         self.assertEqual((self.game / "profile" / "account.uid").read_bytes(), bytes(16))
@@ -447,12 +447,12 @@ class NX2navi(Case):
         (self.game / "profile" / "save-tx" / "commit").write_bytes(b"pending")
         before = (tree(self.hs), tree(self.nx))
         for command in ("import", "export"):
-            code, out, err = self.run_main(command, "nx2navi")
+            code, out, err = self.run_main(command, "pcport")
             self.assertEqual(code, 1)
             self.assertIn("save-tx", err)
         self.assertEqual((tree(self.hs), tree(self.nx)), before)
         self.assertEqual(self.backup_dirs(), [])
-        code, out, err = self.run_main("import", "nx2navi", "--force")
+        code, out, err = self.run_main("import", "pcport", "--force")
         self.assertEqual(code, 0, err)
 
 
@@ -492,6 +492,21 @@ class Guard(Case):
              mock.patch.object(real.subprocess, "run", return_value=mock.Mock(stdout=out)):
             self.assertEqual(real.running_games(), sorted(set(names.values())))
 
+    def test_other_port_runs_as_its_own_program(self):
+        # (another PC port found by its game folder: the programs in that folder are what it runs as)
+        game = self.localappdata / "Programs" / "SomePort" / "game"
+        (game / "profile" / "save").mkdir(parents=True)
+        (game / "SomePort.exe").write_bytes(b"MZ")
+        (game / "readme.txt").write_text("x")
+        real = self.real()
+        with mock.patch.object(real, "WINDOWS", True):
+            names = real.process_names()
+            self.assertEqual(names.get("someport"), "another PC port")
+            self.assertNotIn("readme", names)
+            out = '"SomePort.exe","7","Console","1","10 K"\r\n"notepad.exe","4","x","1","1 K"\r\n'
+            with mock.patch.object(real.subprocess, "run", return_value=mock.Mock(stdout=out)):
+                self.assertEqual(real.running_games(), ["another PC port"])
+
     def test_linux_processes_and_appimages(self):
         real = self.real()
         procs = {"10": ("orchid", "/opt/orchid/orchid"), "11": ("AppRun", "/home/x/eglantine-linux-x86_64.AppImage"),
@@ -505,7 +520,7 @@ class Guard(Case):
         with mock.patch.object(real, "WINDOWS", False), \
              mock.patch.object(real.os, "listdir", return_value=list(procs) + ["self"]), \
              mock.patch("builtins.open", fake_open):
-            self.assertEqual(real.running_games(), ["NX2navi", "Orchid", "PokeDinner or Eglantine"])
+            self.assertEqual(real.running_games(), ["Orchid", "PokeDinner or Eglantine", "another PC port"])
 
 
 # ---- Saves in the repository: scrub, check-repo-saves and the JPEG they write and read (made-up files only) ----

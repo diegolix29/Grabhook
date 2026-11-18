@@ -65,7 +65,10 @@ CACHES = ("hookshot_programs.bin", "hookshot_programs.idx", "hookshot_programs.z
           "hookshot_module_ids.bin", "hookshot_pipelines.bin", "hookshot_pipelines.bin.predicted", "hookshot_pipelines.bin.predicted_keys",
           "hookshot_pipelines.bin.built",
           "hookshot_computes.bin", "hookshot_compute_variants.bin", "hookshot_pipeline_states.bin",
-          "hookshot_pipeline_states_v1.bin", "hookshot_prepared.bin", "hookshot_vk_pipelines.bin", "hookshot_vk_pipelines.stamp")
+          "hookshot_pipeline_states_v1.bin", "hookshot_prepared.bin", "hookshot_vk_pipelines.bin", "hookshot_vk_pipelines.stamp",
+          "hookshot_compiled.bin",   # (RX_VK_SHADER_KEY's list of what the driver built, vk_draw.cpp ledger_path)
+          # (the textures a draw has sampled, for RX_VK_TEX_AHEAD: gpu/vk/texture_ahead.h)
+          "hookshot_textures_drawn.bin")
 PLAY_FILES = re.compile(r"hookshot_vk_pipelines_play_[0-9]+\.bin")   # (what play adds to the pipeline cache: gpu/vk/vk_draw.cpp play_path)
 # (what the game writes into its folder at run time, never a build's output: the caches (and the button prompts it makes) in
 # cache/, the logs in logs/ (host/game_layout.c)
@@ -90,11 +93,17 @@ OLD_TRANSLATOR = ("gpu/vk/eden/", "gpu/vk/sirit/", "gpu/vk/compat/", "gpu/vk/vk_
 TRANSLATOR_FILES = "nx2/translator_files.py"
 RENDERER_ONLY = ("gpu/vk/", "third_party/imgui/", "third_party/fidelityfx", "third_party/xess/")
 INCLUDE = re.compile(r'#\s*include\s+"([^"]+)"')
-NO_MODULE = ("docs/", "tests/", ".github/", ".claude/")
+NO_MODULE = ("docs/", "tests/", ".github/", ".forgejo/", ".claude/")   # (.forgejo: Hookshot's workflows and templates)
 HEADERS = (".h", ".hpp", ".hh", ".inc", ".inl")
 SOURCES = (".c", ".cc", ".cpp") + HEADERS
 # (files the game writes beside itself while it runs, besides the caches: never a build's output, so never "deleted" by a pack)
-WRITTEN_IN_PLAY = ("hookshot_options.ini", "hookshot_log.txt", "hookshot_driver_faults.txt", "hookshot_prepared.bin.warming")
+# (what the game writes beside itself while it runs, never a build's output: settings, logs and reports, and the markers of a
+# skipped preparation and of a slow load (vk_main.cpp, vk_draw.cpp); not seeded either)
+WRITTEN_IN_PLAY = ("hookshot_options.ini", "hookshot_log.txt", "hookshot_log.1.txt", "hookshot_driver_faults.txt",
+                   "hookshot_prepared.bin.warming", "hookshot_pipelines.bin.predicting", "hookshot_pipelines.bin.running",
+                   "hookshot_pipelines.bin.built.warming", "hookshot_prepare_skipped", "hookshot_load_start.txt",
+                   "hookshot_load_start.txt.waited", "hookshot_pipeline_report.txt", "hookshot_frames.csv",
+                   "hookshot_damaged_files.txt")
 
 
 def translator_changed(tree, changed):
@@ -200,6 +209,11 @@ def stamped_may_differ(paths, source):
     return source in paths or any(p.endswith(HEADERS) for p in paths)
 
 
+# (modules the build imports that are the lift's own: nx2/chunks.py, which an all-O2 build's chunk_parts cuts the lifted C
+# with, and the translator under it. A change to it shows in the objects the lift and the build make from it)
+LIFT_MODULES = {"chunks"}
+
+
 def build_scripts(root):
     """nx2/build.py and every Python module it imports (as make_game.lift_sources finds the lift's: a64-kit's folders, then nx2/),
     and nx2/make_game.py, which sets build.py's environment (the hot order, the profile)"""
@@ -221,6 +235,8 @@ def build_scripts(root):
             else:
                 continue
             for name in names:
+                if name.split(".")[0] in LIFT_MODULES:   # (the lift's: a change shows in the objects it makes)
+                    continue
                 for d in path:
                     m = os.path.join(d, name.split(".")[0] + ".py")
                     if os.path.isfile(m):
@@ -362,13 +378,31 @@ PREPARE_FAILED = {3: "no usable Vulkan here", 4: "the GPU driver stopped respond
 
 def prepare(game, b, required=True):
     """The game's own preparation in a game folder, as make_game.py runs it (the game's environment, without the build's
-    switches), with the base's budget; nothing on a Windows game built on Linux, which prepares at its first start"""
+    switches), with the base's budget; nothing on a Windows game built on Linux, which prepares at its first start. required:
+    a failure stops (a runtime); otherwise (a base) it leaves the work to the first start, as make_game.py's own preparation
+    does. Returns why the shaders were not prepared now, or None"""
     if CROSS:
-        print("the shaders were not prepared now (a Windows game built on Linux): the game prepares them at its first start", flush=True)
-        return
-    print("+ %s --prepare-shaders%s" % (GAME, " (RX_VK_PREDICT_S=%d)" % b["predict_s"] if b.get("predict_s") else ""), flush=True)
-    subprocess.run([os.path.join(game, GAME), "--prepare-shaders"], cwd=game, check=True,
-                   env=dict(load_make_game().game_env(), **base_env(b.get("predict_s", 0))))
+        why = "a Windows game built on Linux"
+        print("the shaders were not prepared now (%s): the game prepares them at its first start" % why, flush=True)
+        return why
+    mg = load_make_game()
+    # (make_game.py's Compile shaders level, as its own preparation passes it: the folder's choice, else Most; none on a tree
+    # from before the levels)
+    level = (getattr(mg, "folder_compile_level", lambda g: None)(game) or "most") if hasattr(mg, "COMPILE_LEVELS") else None
+    cmd = [os.path.join(game, GAME), "--prepare-shaders"] + (["--compile-shaders", level] if level else [])
+    print("+ %s%s" % (" ".join([GAME] + cmd[1:]), " (RX_VK_PREDICT_S=%d)" % b["predict_s"] if b.get("predict_s") else ""), flush=True)
+    try:
+        code = subprocess.run(cmd, cwd=game, check=required, env=dict(mg.game_env(), **base_env(b.get("predict_s", 0)))).returncode
+    except OSError as e:   # (the game could not start: a missing DLL, launch denied)
+        if required:
+            raise
+        code, why = None, str(e)
+    if code:
+        why = PREPARE_FAILED.get(code, "the game stopped with exit status %d" % code)
+    if code != 0:
+        print("the shaders were not prepared now (%s): the game prepares them at its first start" % why, flush=True)
+        return why
+    return None
 
 
 def make_game(tree, b, work, game, env):
@@ -381,10 +415,15 @@ def read_base(d):
         return json.load(f)
 
 
-def write_base(d, b):
-    if not all(os.path.isfile(os.path.join(b["game"], m[0])) for m in MODULES):   # (make_game.py's launcher layout: game/bin/)
+def plain_game(game):
+    """A base's game folder has both modules beside each other (make_game.py's launcher layout keeps them in game/bin/)"""
+    if not all(os.path.isfile(os.path.join(game, m[0])) for m in MODULES):
         sys.exit("%s has no %s and %s beside each other: a base is a plain game folder (not a launcher's, with bin/)" %
-                 (b["game"], GAME, RENDERER))
+                 (game, GAME, RENDERER))
+
+
+def write_base(d, b):
+    plain_game(b["game"])
     b["modules"] = {m[0]: sha(os.path.join(b["game"], m[0])) for m in MODULES}
     with open(os.path.join(d, "base.json"), "w", encoding="utf-8") as f:
         json.dump(b, f, indent=1)
@@ -418,13 +457,10 @@ def check_folders(d, b):
                          (what, b[what], f))
 
 
-def game_language(game):
-    """The language a game folder was built in (its language.txt), so a pack is built in the base's"""
-    try:
-        with open(os.path.join(game, "language.txt"), encoding="utf-8") as f:
-            return next((line.strip() for line in f if line.strip() and not line.startswith("#")), None)
-    except OSError:
-        return None
+def game_language(game, root=ROOT):
+    """The language a game folder was built in, so a pack is built in the base's: make_game.py's own reader of its
+    language.txt (a known code line; comments, also indented ones, and anything else skipped), or None"""
+    return load_make_game(root).folder_language(game)
 
 
 def link_or_copy(src, dst):
@@ -473,12 +509,17 @@ def cmd_base(a):
     b = {"commit": git(tree, "rev-parse", "HEAD"), "work": work, "game": game, "romfs": os.path.abspath(a.romfs),
          "exefs": os.path.abspath(a.exefs), "seeded_from": a.seed, "language": a.language, "predict_s": a.predict_s}
     t = time.time()
-    # (a budget: make_game.py builds without preparing, then the preparation runs here with it, so it never reaches the lift key)
-    make_game(tree, b, work, game, {"HOOKSHOT_NO_PREPARE": "1"} if a.predict_s > 0 else {})
-    if a.predict_s > 0:
-        prepare(game, b)
-    b["build_s"] = round(time.time() - t)
+    # (make_game.py builds without preparing; the outputs are recorded then, before the preparation, so nothing it writes beside
+    # the game (caches, markers, files the renderer adds later) is ever taken for a build's output; then the preparation runs
+    # here, with the budget if one is set, which so never reaches make_game.py's lift key)
+    make_game(tree, b, work, game, {"HOOKSHOT_NO_PREPARE": "1"})
     b["outputs"] = build_outputs(game)
+    if os.environ.get("HOOKSHOT_NO_PREPARE", "0") != "0":   # (as make_game.py reads it: set and not 0)
+        b["not_prepared"] = "HOOKSHOT_NO_PREPARE is set"
+        print("the shaders were not prepared now (HOOKSHOT_NO_PREPARE is set): the game prepares them at its first start", flush=True)
+    else:   # (a failure keeps the compiled base, its reason in base.json)
+        b["not_prepared"] = prepare(game, b, required=False)
+    b["build_s"] = round(time.time() - t)
     for m in MODULES:   # (the maps beside the modules, for profilers)
         if m[1]:
             shutil.copy2(os.path.join(work, "sa", "build", m[1]), os.path.join(game, m[1]))
@@ -489,6 +530,7 @@ def cmd_base(a):
 def cmd_adopt(a):
     d = os.path.abspath(a.dir)
     check_folders(d, {"work": a.work, "game": a.game})
+    plain_game(a.game)   # (before anything is asked of the tree or written)
     ensure_dir(d)
     write_base(d, {"commit": git(os.path.abspath(a.tree), "rev-parse", "HEAD"), "work": os.path.abspath(a.work),
                    "game": os.path.abspath(a.game), "romfs": os.path.abspath(a.romfs), "exefs": os.path.abspath(a.exefs),

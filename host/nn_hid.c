@@ -41,6 +41,7 @@
 #include "hos_motion.h"
 #include "auto_run.h"   /* (the Insert menu's Auto run) */
 #include "hold_toggle.h"
+#include "hos_atomic_file.h"   /* (the sensitivity is written whole or not at all) */
 #ifndef HOOKSHOT_ENV_H   /* (env_on: the switches' one rule) */
 #include "../gpu/vk/compat/hookshot_env.h"
 #endif
@@ -100,8 +101,9 @@ extern const char *hos_user_dir;
 static void mouse_sens_save(void) {
     char path[512];
     snprintf(path, sizeof path, "%s/mouse_sens.txt", hos_user_dir ? hos_user_dir : "user");
-    FILE *f = fopen(path, "w");
-    if (f) { fprintf(f, "%.3f\n", hos_mouse_sens); fclose(f); }
+    char text[32];
+    const int n = snprintf(text, sizeof text, "%.3f\n", hos_mouse_sens);
+    if (n > 0) hos_atomic_write(path, text, (size_t)n);
 }
 
 /* The Insert menu keeps the sensitivity (its Mouse sensitivity row, option 7, in percent), read with each read; - and =
@@ -417,6 +419,15 @@ static void live_input(void) {
                     hos_bind(HOS_BIND_PAD, bind_b, 0, bind_pad);
                 extern volatile int hos_prompts_row;   /* host/prompts.c: "!prompts <0 Auto, HOS_PROMPT_* + 1>", as the row */
                 if (!strncmp(line, "!prompts ", 9)) __atomic_store_n(&hos_prompts_row, atoi(line + 9), __ATOMIC_RELAXED);
+                /* "!pos x y z": Link moved to that position in the map he is in (host/hos_main.c, the return cheat) */
+                extern volatile int hos_oot_live_pos_pending;
+                extern volatile float hos_oot_live_pos[3];
+                float px, py, pz;
+                if (!strncmp(line, "!pos ", 5) && sscanf(line + 5, "%f %f %f", &px, &py, &pz) == 3) {
+                    hos_oot_live_pos[0] = px, hos_oot_live_pos[1] = py, hos_oot_live_pos[2] = pz;
+                    __atomic_store_n(&hos_oot_live_pos_pending, 1, __ATOMIC_RELEASE);
+                    __atomic_store_n(&hos_oot_live_action, 3, __ATOMIC_RELAXED);
+                }
                 hos_log("hid: live command at %.1f s: %.*s", at / 1000.0, (int)(n > 1 ? n - 1 : 0), line);
                 continue;
             }

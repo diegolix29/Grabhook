@@ -23,8 +23,10 @@ def main():
 #include <map>
 #include <mutex>
 #include <vector>
+#include "import_reach.h"
 
 struct Pool { uint64_t lo, hi, memory; };
+import_reach::Reach live_reach;   // (the import table's reach: gpu/vk/vk_memory.cpp)
 std::map<uint64_t, Pool> imported;
 std::deque<decltype(imported)::node_type> retired_pools, evicted_pools;
 std::mutex pools_mu, bg_mu;
@@ -36,6 +38,7 @@ std::deque<DeadImport> dead_imports;
 
 int main() {
     imported.emplace(0x2000, Pool{0x2000, 0x5000, 1});
+    live_reach.add(0x5000 - 0x2000);   // (as imported_add counts it)
     auto check = [] {
         assert(!memory_guest_imported(0x1000, 0x2000));
         assert(!memory_guest_imported(0x5000, 0x6000));
@@ -58,7 +61,7 @@ int main() {
         cpp = Path(tmp) / "check.cpp"
         exe = Path(tmp) / "check.exe"
         cpp.write_text(fixture, encoding="utf-8")
-        subprocess.run([args.cxx, "-std=c++17", str(cpp), "-o", str(exe)], check=True)
+        subprocess.run([args.cxx, "-std=c++20", "-I", str(ROOT / "gpu/vk"), str(cpp), "-o", str(exe)], check=True)
         subprocess.run([str(exe)], cwd=tmp, check=True)
 
 

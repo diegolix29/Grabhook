@@ -10,6 +10,7 @@
 #include "vk_fps.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <mutex>
 
 #include "vk_draw.h"
@@ -18,6 +19,7 @@
 namespace mkwvk {
 
 std::atomic<int> fps_level_now{0};
+const bool fps_traced = getenv("RX_VK_FRAME_TRACE") && atoi(getenv("RX_VK_FRAME_TRACE"));
 int64_t gpu_time_ns();     // (vk_replay.cpp: the GPU's time in the timed recordings so far)
 int64_t slot_wait_ns();    // (and the replay's waits for a recording slot: inside the renderer's entries, on this thread)
 
@@ -41,6 +43,7 @@ thread_local bool on_render_thread = false;
 
 std::mutex ring_mu;
 fs::Ring<fs::kRing> ring;
+fs::Frame last_frame;   // (the frame trace's: fps_last_frame, on the presenting thread)
 
 }   // namespace
 
@@ -75,8 +78,15 @@ FpsRender::~FpsRender() {
     tt.render += fps_clock() - t0 - (tt.waits - w0);
 }
 
+fs::Frame fps_last_frame() {
+    std::lock_guard lk(ring_mu);   // (with the render thread, read there)
+    return last_frame;
+}
+
 void fps_presented() {
-    const int level = fps_level_now.load(std::memory_order_relaxed);
+    // (the frame trace measures as the Breakdown does, whatever the counter shows)
+    const int level = fps_traced ? std::max<int>(fps_level_now.load(std::memory_order_relaxed), fs::kBreakdown)
+                                 : fps_level_now.load(std::memory_order_relaxed);
     // (the last frame's state, for the next one: on the presenting thread only)
     static int64_t last_at = 0, last_render = 0, last_wait[fs::kParts] = {}, last_slept[2] = {}, last_gpu = 0, last_pipes = 0,
                    last_left = 0, last_slot = 0;
@@ -131,9 +141,10 @@ void fps_presented() {
             f.pipelines = (uint16_t)std::clamp<int64_t>(pipes - last_pipes, 0, 65535);
             f.left_out = (uint16_t)std::clamp<int64_t>(left - last_left, 0, 65535);
         }
-        if (f.ms > 0) {   // (two presents in the same clock tick: not a frame)
+        {
             std::lock_guard lk(ring_mu);
-            ring.push(f);
+            last_frame = f;
+            if (f.ms > 0) ring.push(f);   // (two presents in the same clock tick: not a frame)
         }
     }
     last_at = now, last_level = level;

@@ -182,7 +182,10 @@ def parse_pchtxt(text):
         elif line.startswith("@flag"):
             f = line.split()
             if len(f) >= 3 and f[1] == "offset_shift":
-                shift = int(f[2], 0)
+                try:   # (0x..., decimal, or else hex without 0x, as the offsets are written: "0100")
+                    shift = int(f[2], 0)
+                except ValueError:
+                    shift = int(f[2], 16)
         elif line.startswith("@") or not enabled:
             continue
         else:

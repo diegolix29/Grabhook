@@ -21,13 +21,14 @@ struct Stage {
     int nvn_stage = 0;   // 0 vertex, 1 fragment, 5 compute (what its banks are read for)
     VkShaderStageFlagBits vk_stage = VK_SHADER_STAGE_VERTEX_BIT;
     VkShaderModule module = VK_NULL_HANDLE;
-    bool subgroups = true;   // its SPIR-V asks for a subgroup capability (spirv_uses_subgroups); true when not known
     Shader::Info info;
     std::vector<uint8_t> c1;   // its c1 constants (the code area's tail)
+    uint32_t spirv_words = 0;   // (its SPIR-V's size in 32-bit words, for a program read back from the program cache; 0: not known)
     // (hookshot) its SPIR-V's OpPhi instructions (fallback_size_policy.h), noted where the SPIR-V is written to or read from the
     // program cache (vk_progcache.cpp), which every translated program passes. Not in vk_shader.cpp, whose bytes are part of
     // the translator's stamp: a change there translates every player's programs again
     mutable uint32_t phis = 0;
+    mutable uint32_t calls = 0;   // (hookshot) its OpFunctionCall instructions, noted with the phis (fallback_size_policy.h)
     // (hookshot) where its SPIR-V is in hookshot_programs.bin, and how many words (0: compressed or translated in this run, so
     // its module stays): once precompile_run has built its pipelines, its module can be let go on Linux and made again from the
     // file if play ever builds a new pipeline state variant for this program
@@ -39,9 +40,6 @@ struct Stage {
     uint64_t record_size = 0;
 };
 
-/// The SPIR-V declares a capability that lets it see its subgroup (GroupNonUniform*, the KHR ballot and vote,
-/// cooperative matrices, Groups): its lanes' count matters to it. Read from the capabilities at the module's head
-bool spirv_uses_subgroups(const std::vector<uint32_t>& spirv);
 
 /// A texture handle the stage reads from a storage buffer: its handle program (Shader::Info::handle_programs, Eden's
 /// recompiler) run over the stage's constant banks and storage buffers as the draw has them. element is the descriptor
@@ -133,6 +131,7 @@ void program_load_async_here(bool on);
 /// (hookshot) a cached program's stand-in: once ready (and failed), its records are read and the draw picks again
 bool program_is_stand_in(const Program* p);
 uint64_t program_cache_stamp();   // (what the kept programs and pipelines are good for)
+void cache_sets_switch();          // (another GPU's caches aside, this one's back: vk_progcache.cpp, gpu_sets.h)
 size_t program_cache_kept();   // (hookshot) program keys in the cache now, SIZE_MAX: no cache
 /// (hookshot) RX_VK_SHADER_KEY (default on, 0: off): programs get a fingerprint of what the driver compiles, and a start after a translator
 /// change builds again only what the fingerprints say the driver has not seen (vk_draw.cpp, the compiled ledger)
@@ -168,6 +167,7 @@ struct KeptProgram {
 };
 void program_cache_each(const std::function<void(const KeptProgram&)>& fn);   // (fn: on several threads at once, in no order)
 void program_cache_borrow(uint64_t key, const std::function<void(Program&)>& fn);   // (made for fn, then let go; still kept)
+void program_cache_borrow_all(uint64_t key, const std::function<void(std::vector<std::unique_ptr<Program>>&)>& fn);   // (every variant at once)
 /// (hookshot) A compute program read from the cache at its key's first pick has no code yet (vk_progcache.cpp
 /// program_cache_load): its SPIR-V is read and its module made here, before the first use of the module (vk_draw.cpp dispatch).
 /// True: it is whole (or was). False: its code did not read or made no module; it is marked failed

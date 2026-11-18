@@ -31,7 +31,8 @@ def tables():
     for name, body in re.findall(r'inline constexpr Entry (k\w+)\[\] = \{\n(.*?)\n\};', src, re.S):
         pairs = re.findall(r'^    \{"((?:[^"\\]|\\.)*)", "((?:[^"\\]|\\.)*)"\},$', body, re.M)
         out[name] = pairs
-    langs = re.findall(r'^    \{"([\w-]+)", "((?:[^"\\]|\\.)*)", (\w+), (\d+)\},$', src, re.M)
+    # (English's row {"en", "English", nullptr, 0}; the others lang(code, name, table), whose count is the table's length)
+    langs = re.findall(r'^    (?:\{|lang\()"([\w-]+)", "((?:[^"\\]|\\.)*)", (\w+)(?:, (\d+)\}|\)),$', src, re.M)
     return out, langs
 
 
@@ -42,12 +43,14 @@ class MenuI18nTests(unittest.TestCase):
         self.menu = set(c_strings(menu))
 
     def test_languages(self):
-        self.assertEqual(self.langs[0][:3], ("en", "English", "nullptr"))
+        self.assertEqual(self.langs[0], ("en", "English", "nullptr", "0"))
         codes = [code for code, _, _, _ in self.langs]
         self.assertEqual(len(codes), len(set(codes)), "a language listed twice")
         for code, _, table, count in self.langs[1:]:
             self.assertIn(table, self.tables, code)
-            self.assertEqual(len(self.tables[table]), int(count), "%s: its count is not its table's" % code)
+            # (tests/test_menu_i18n_count.py checks the counts as compiled)
+            self.assertEqual(count, "", "%s: a count written by hand, not lang()'s, its table's length" % code)
+        self.assertEqual(sorted(table for _, _, table, _ in self.langs[1:]), sorted(self.tables), "a table no language reads")
 
     def test_texts_are_the_menus(self):
         for table, pairs in self.tables.items():
@@ -90,11 +93,11 @@ class MenuI18nTests(unittest.TestCase):
             "Output device", "Where the game plays sound. Changes apply without restarting the game.",
             "Where the game plays sound. A change briefly restarts only the audio stream.",
             "HOS_AUDIO_DEVICE overrides this run. The saved device choice is kept.",
-            "Named playback selection is Windows-only in this build. Default uses the system output.",
             "No playback output could be opened. The game keeps trying.",
             "Default is used temporarily. The selected output is remembered and retried when available.",
             "This playback device. Speaker layout changes still require a game restart.",
             "Follow the Windows default playback device.", "Overridden by HOS_AUDIO_DEVICE",
+            "Follow the system default playback device.",
             "Selected output", "Default", " (not connected)",
         )
         self.assertEqual(len(self.tables), 13)

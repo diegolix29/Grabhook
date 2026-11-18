@@ -131,7 +131,7 @@ static int64_t hos_now_ns(void) { return 0; }
 static int npresses;
 static int64_t script_end_ms;
 static int64_t script_elapsed_ms(int64_t now) { (void)now; return 0; }
-static void scripted_input(uint64_t *b, int32_t s[4]) { (void)b; (void)s; }
+static void scripted_input(uint64_t *b, uint64_t *t, int32_t s[4]) { (void)b; (void)t; (void)s; }
 void hos_oot_autoload_input(void) {}   /* (host/oot_autoload.c: Skip title screen off) */
 int hos_control_input(uint64_t *buttons, int32_t stick[4]) { (void)buttons; (void)stick; return 0; }   /* (host/control.c: off) */
 static int game_in_front(void) { return front; }
@@ -167,7 +167,8 @@ static int fails;
 static uint64_t buttons;
 static int32_t st[4];
 static void poll(void) {
-    read_input(&buttons, st);
+    uint64_t taps;   /* (the presses read_input reports apart, nn_hid.c: none asked of here) */
+    read_input(&buttons, &taps, st);
     CHECK(oc_consumed_pads == 0);   /* the inactive note layer must not consume the controller while walking */
 }
 static void release(void) { memset(held, 0, sizeof held); }

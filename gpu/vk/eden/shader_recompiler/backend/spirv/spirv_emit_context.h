@@ -7,6 +7,7 @@
 #pragma once
 
 #include <array>
+#include <functional>
 
 #include <sirit/sirit.h>
 #include "common/container/unordered_set.h"
@@ -354,6 +355,12 @@ public:
         StorageDefinitions vars{};
     };
     std::vector<GlobalTableVars> ssbo_tables;
+    /// (RX_VK_MESH_G3, task and mesh stages) code the first block runs before anything else: the global accesses' buffer ranges, worked out once
+    std::vector<std::function<void()>> entry_emitters;
+    void EmitEntryPrologue() {
+        for (auto& f : entry_emitters) f();
+        entry_emitters.clear();
+    }
     std::array<Id, 9> atomic_global_func_u32{};
     Id atomic_global_cas_func_u32{};   // (hookshot) (address, comparator, value) -> the old value
 
@@ -406,6 +413,8 @@ public:
     /// (hookshot) a fallback mesh workgroup's slot (task workgroup * threads + its index), read from the task's map in the
     /// entry block (EmitMeshPrologue); invalid without a task program, where the slot is the workgroup id
     Id mesh_fallback_slot{};
+    Id mesh_fallback_epilogue_word{};   ///< (hookshot) the fallback epilogue's loop index, a function variable of the entry block
+    Id mesh_fallback_epilogue_line{};   ///< (hookshot) the Soa records' line, WriteFallbackLines' inner loop index, as above
     Id mesh_shared_u32{};   ///< pointer type to one workgroup word
     Id mesh_primitive_indices{};
     MeshInfo mesh_info{};
@@ -429,6 +438,7 @@ public:
     // the payload, map and record buffers, pushed as device addresses; a generated vertex stage reads the records.
     bool mesh_fallback{};
     bool wants_mesh_fallback{};
+    u32 ir_instruction_count{};   ///< (hookshot, global_helper_policy.h) the program's IR instructions, counted before the emission
     Id mesh_fallback_word_ptr{};   ///< PhysicalStorageBuffer pointer to a block of one u32
     u32 mesh_fallback_payload_member_index{};
     u32 mesh_fallback_records_member_index{};

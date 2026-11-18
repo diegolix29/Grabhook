@@ -100,8 +100,11 @@ struct Texture {
     std::unordered_map<uint64_t, VkImageView> views;
     struct BlockAttachment { VkImage image; VmaAllocation allocation; int format; uint32_t level; };
     std::vector<BlockAttachment> block_attachments;
+    uint64_t defer_frame = 0;   // (the upload budget's deferral: upload_defer)
 };
 static uint64_t rec_value = 0, destroy_gen = 1, total_bytes = 1 << 20;
+static void destroy_gen_bump(const Texture*) {}   // (vk_texture.cpp: the gone ring's generation, which the caches read)
+static void defer_note_done(Texture&, bool) {}   // (vk_texture.cpp: the deferral's age)
 static void logf(const char*, ...) {}
 static void full_barrier(VkCommandBuffer, const char* = nullptr) {}
 static void destroy_buffer(VkBuffer, VmaAllocation) {}

@@ -2,8 +2,9 @@
 """When kept programs are loaded by default (gpu/vk/load_default.h): RX_VK_LOAD always wins; without it, at their create calls
 wherever no earlier session left the marker, with mesh shaders or through the compute fallback; the safety net's limits
 against the measured sessions; the marker written and found. And the source: the choice is made once the device is up, a
-first use's time with a load goes through the safety net, and a preparation removes the marker. Compiled and run alone: no
-game or GPU is needed.
+first use's time with a load goes through the safety net, and a preparation removes the pipelines-built marker only when
+it notes a pipeline it had not noted before (an update that changes no shader must not make the next start build every
+pipeline again). Compiled and run alone: no game or GPU is needed.
 """
 import argparse
 import subprocess

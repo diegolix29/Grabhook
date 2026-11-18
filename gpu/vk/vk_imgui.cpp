@@ -40,8 +40,12 @@ ImTextureData* logo_ = nullptr;
 float logo_aspect = 1;
 int64_t presents = 0;   // (frames recorded: when a texture or a staging buffer let go can be destroyed)
 
+/// Dear ImGui's Vulkan functions, instance-level ones among them (vkGetPhysicalDeviceMemoryProperties, the surface queries): all
+/// from vkGetInstanceProcAddr, which answers for both levels. vkGetDeviceProcAddr was asked first: for an instance-level name
+/// its result is NULL only since Vulkan 1.2.193 and undefined before, an older loader or driver may hand back a function that
+/// takes the driver's own physical device where ImGui passes the loader's (the validation layer's
+/// WARNING-vkGetDeviceProcAddr-device, for 8 names). The device-level ones come through the loader's dispatch: a few calls a frame
 PFN_vkVoidFunction load(const char* name, void*) {
-    if (PFN_vkVoidFunction f = vkGetDeviceProcAddr(dev.device, name)) return f;
     return vkx::instance_proc_addr()(dev.instance, name);
 }
 
@@ -404,7 +408,7 @@ bool init() {
     ii.Queue = dev.queue;   // (for the backend's own uploads, never used here: update_texture)
     ii.DescriptorPoolSize = 16;   // (the backend's own pool: the textures' descriptor sets)
     ii.MinImageCount = 2;
-    ii.ImageCount = 4;            // (its vertex buffers in turn: one more than the three frames present_image keeps in flight)
+    ii.ImageCount = kPresentSlotsMax + 1;   // (its vertex buffers in turn: one more than present_image's frame slots)
     ii.UseDynamicRendering = true;
     ii.PipelineInfoMain.PipelineRenderingCreateInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO;
     ii.PipelineInfoMain.PipelineRenderingCreateInfo.colorAttachmentCount = 1;

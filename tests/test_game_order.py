@@ -22,7 +22,7 @@ def main():
          "only with nothing recorded since the last dispatch"),
         ('!par_active.load(std::memory_order_relaxed);' in draw.split("const bool after_dispatch")[1][:400],
          "not in a parallel replay"),
-        ('if (work_since_barrier && !no_order && !after_dispatch) full_barrier(cmd, "barrier (dispatch)");' in draw,
+        ('if (work_since_barrier && !after_dispatch) full_barrier(cmd, "barrier (dispatch)");' in draw,
          "every other dispatch keeps its barrier"),
         ('last_dispatch_cmd = cmd, last_dispatch_epoch = work_epoch.load(std::memory_order_relaxed);' in draw,
          "the count noted after the dispatch's own command"),

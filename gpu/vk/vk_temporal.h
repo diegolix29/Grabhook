@@ -26,6 +26,11 @@ bool temporal_env_chosen();
 bool temporal_scene_format(VkFormat format);
 bool temporal_colour_pair(VkFormat input, VkFormat output);
 bool temporal_wanted();       // (temporal_mode() != GAME)
+/// (hookshot) No engine (temporal_mode() is GAME: the game's own upscaler or the Upscaler's Off) and AMD FSR 3.1's frame
+/// interpolation asked for (vk_fsr3fi.h frames_wanted): the chain still takes the scene's camera and skinned draws, and makes
+/// the motion at the gameplay upscale's dispatch for that interpolation (actor motion in it), leaving the picture to the
+/// network. Its inputs are then as good as with an engine drawing
+bool temporal_fg_inputs();
 /// The Upscaler row's Off (upscaler_rows.h OFF) with no engine running over it for this run (temporal_mode() is GAME): no
 /// upscaler at all. temporal_upscale then leaves the game's network out too and stretches its input to its output with a plain
 /// linear filter
@@ -57,6 +62,13 @@ struct SkinnedDraw {
     uint64_t program = 0;
 };
 void temporal_note_skinned_draw(const SkinnedDraw& k);
+
+/// (hookshot) The hidden-mesh rule's switches (vk_draw.cpp hidden_depth_draw, gpu/vk/hidden_mesh.h). Bit 0: the depth
+/// draws of hidden meshes are left out (unless RX_VK_DLSS_FADED=0); bit 1: the detailed log (RX_VK_DLSS_FADED_LOG=1). 0:
+/// nothing runs, as with the parallel replay (RX_VK_PARALLEL=2 and more). Read once; the first call logs what it is
+int temporal_hidden_mesh_mode();
+/// (hookshot) Whether `depth` is the depth target of the scene the chain has taken in this frame (its camera's)
+bool temporal_scene_depth_is(const Texture* depth);
 
 /// A gameplay upscale's dispatch (program `key`; vk_draw.cpp's temporal_stand_in finds them: the 4/3 network fd029a317a9a4b94
 /// at the game's usual 3/4, the same-size pass 9dc98871eb7fc101 at full size, and one network of its own for each other

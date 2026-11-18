@@ -11,9 +11,9 @@ files, so a copy is all it takes.
     --json (any command): one line of JSON on stdout instead of text, for the builders' Saves page
 
 import copies into Hookshot, export copies out of it. <name> is one of EMULATORS below: lichii, frizti, orchid,
-pokedinner, eden, eglantine, nx2navi or longshot (Hookshot with add-ons: the same save files) (to-lichii and to-hookshot still work: they are export lichii and import
+pokedinner, eden, eglantine, pcport (another PC port of the game) or longshot (Hookshot with add-ons: the same save files) (to-lichii and to-hookshot still work: they are export lichii and import
 lichii). --from/--to name the other side's folder instead of where it is looked for: the save folder itself (the one
-with account.sav and slot_*), or a folder above it (an emulator's data folder, a portable user folder, NX2navi's game
+with account.sav and slot_*), or a folder above it (an emulator's data folder, a portable user folder, the other port's game
 folder), which is searched for the game's saves. --hookshot DIR does the same for Hookshot's side: its data folder
 (Linux: $XDG_DATA_HOME/hookshot, default ~/.local/share/hookshot) or, on Windows, its game folder (the one with
 image.bin and user\\), which has to be given there. The side being overwritten is copied first to
@@ -28,6 +28,7 @@ import argparse
 import collections
 import contextlib
 import datetime
+import glob
 import json
 import os
 import re
@@ -59,9 +60,12 @@ EMULATORS = [
     Program("eden", "Eden", EDEN, ["eden"], []),
     Program("eglantine", "Eglantine", {"linux": ["{data}/eglantine"], "windows": ["{appdata}/eglantine"]},
             ["eglantine"], []),
-    Program("nx2navi", "NX2navi", {"linux": ["{home}/Games/Ocarina"],
-                                   "windows": ["{localappdata}/Programs/NX2navi/game", "C:/Games/Ocarina"]},
-            ["nx2navi", "ocarina"], []),
+    # (another PC port of the game: a game folder with profile/save/<account> in it, installed under
+    # %LOCALAPPDATA%\Programs\<its name>\game on Windows; its own programs in that folder are its processes too,
+    # port_processes)
+    Program("pcport", "another PC port", {"linux": ["{home}/Games/Ocarina"],
+                                          "windows": ["{localappdata}/Programs/*/game", "C:/Games/Ocarina"]},
+            ["ocarina"], ["pc-port", "port"]),
 ]
 HOOKSHOT = Program("hookshot", "Hookshot", {"linux": ["{data}/hookshot"], "windows": []}, ["hookshot"], [])
 FOLDER = Program("folder", "the folder", {"linux": [], "windows": []}, [], [])
@@ -71,7 +75,7 @@ FOLDER = Program("folder", "the folder", {"linux": [], "windows": []}, [], [])
 LAYOUTS = (
     ("nand", "user", "save", "account", "<id>", TITLE, "0"),   # Eden's newer layout: used first when it exists
     ("nand", "user", "save", NO_ACCOUNT, "<id>", TITLE),        # Eden and its forks (Lichii, Eglantine, ...)
-    ("profile", "save", "<id>"),                                 # NX2navi's game folder
+    ("profile", "save", "<id>"),                                 # the other PC port's game folder
     ("user", "save", "<id>"),                                    # Hookshot's game folder on Windows
     ("save", "<id>"),                                            # Hookshot's data folder
 )
@@ -98,7 +102,14 @@ def folders(program):
     values = {"data": data_home(), "home": home,
               "appdata": os.environ.get("APPDATA") or os.path.join(home, "AppData", "Roaming"),
               "localappdata": os.environ.get("LOCALAPPDATA") or os.path.join(home, "AppData", "Local")}
-    return [os.path.normpath(t.format(**values)) for t in program.folders["windows" if WINDOWS else "linux"]]
+    out = []
+    for t in program.folders["windows" if WINDOWS else "linux"]:
+        path = os.path.normpath(t.format(**values))
+        if "*" in path:   # (a folder under every program there that has the game's profile folder in it)
+            out += [m for m in sorted(glob.glob(path)) if os.path.isdir(os.path.join(m, "profile"))]
+        else:
+            out.append(path)
+    return out
 
 
 def subdirs(path):
@@ -174,8 +185,9 @@ def locate(program, override, flag):
     if program is HOOKSHOT and not tried:
         raise Fail("Hookshot's saves are in the user folder of your game folder on Windows: pass the game folder with "
                    "--hookshot (for example --hookshot C:\\Games\\Hookshot)")
-    raise Fail("no %s save found (looked in %s): start the game in %s once and save, or pass %s <folder>"
-               % (program.display, ", ".join(tried) or "no default folder", program.display, flag))
+    what = "save of " + program.display if program.display.startswith("another ") else program.display + " save"
+    raise Fail("no %s found (looked in %s): start the game in %s once and save, or pass %s <folder>"
+               % (what, ", ".join(tried) or "no default folder", program.display, flag))
 
 
 def pick(found, name, flag, wanted=None):
@@ -191,7 +203,7 @@ def pick(found, name, flag, wanted=None):
 
 
 def pending_commit(save):
-    """NX2navi writes a save to profile/save-tx first and moves it into profile/save/<account> after: while something is
+    """The other PC port writes a save to profile/save-tx first and moves it into profile/save/<account> after: while something is
     waiting there, that is the save the game loads next, not the account folder."""
     parent = os.path.dirname(os.path.normpath(save))
     tx = os.path.join(os.path.dirname(parent), "save-tx")
@@ -206,9 +218,23 @@ def process_names():
     """{process name: what it belongs to} for every program in the tables."""
     names = collections.OrderedDict()
     for program in [HOOKSHOT] + EMULATORS:
-        for p in program.processes:
-            names[p] = names[p] + " or " + program.display if p in names else program.display
+        for p in program.processes + (port_processes(program) if program.name == "pcport" else []):
+            if p not in names:
+                names[p] = program.display
+            elif program.display not in names[p].split(" or "):
+                names[p] += " or " + program.display
     return names
+
+
+def port_processes(program):
+    """The programs in the other PC port's game folders (lower case, without .exe): what it runs as, whatever its name."""
+    out = []
+    for folder in folders(program):
+        for n in sorted(os.listdir(folder)) if os.path.isdir(folder) else []:
+            path, (stem, ext) = os.path.join(folder, n), os.path.splitext(n.lower())
+            if os.path.isfile(path) and (ext == ".exe" if WINDOWS else not ext and os.access(path, os.X_OK)):
+                out.append(stem)
+    return out
 
 
 def running_games():
@@ -260,7 +286,7 @@ def show(title, folder, found):
         for line in describe(found[k]) or ["(no slots)"]:
             print("      " + line)
         if pending_commit(found[k]):
-            print("      (a save is still waiting in %s: start and quit NX2navi before copying)" % pending_commit(found[k]))
+            print("      (a save is still waiting in %s: start and quit that game before copying)" % pending_commit(found[k]))
 
 
 def list_all(args):
@@ -1130,7 +1156,7 @@ def run(args):
     if not args.force:
         tx = pending_commit(em_path)
         if tx:
-            raise Fail("NX2navi still has a save waiting in %s, which it loads instead of %s: start NX2navi and quit "
+            raise Fail("A save is still waiting in %s, which the game loads instead of %s: start that game and quit "
                        "it from the game, then copy (or pass --force)" % (tx, em_path))
     if not args.dry_run and not args.force:
         busy = running_games()
@@ -1169,7 +1195,7 @@ def main(argv=None):
     p.add_argument("--keep-settings", action="store_true", help="leave the target's option.sav (the game's settings) alone")
     p.add_argument("--dry-run", action="store_true", help="say what would happen and change nothing")
     p.add_argument("--force", action="store_true",
-                   help="copy even if a game seems to be running, or NX2navi has a save waiting")
+                   help="copy even if a game seems to be running, or another port has a save waiting")
     p.add_argument("--json", action="store_true", help="answer with one line of JSON (the builders' Saves page)")
     args = p.parse_args(argv)
     if args.command in ("to-lichii", "to-hookshot"):

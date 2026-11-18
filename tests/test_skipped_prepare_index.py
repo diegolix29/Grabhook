@@ -40,6 +40,7 @@ std::unordered_set<uint64_t> received;
 bool programs_load_at_create() { return create_mode; }
 void pcache_init() { calls.push_back(1); }
 bool env_on(const char*) { return omit_states; }
+const char* precompile_computes_which() { return nullptr; }   // (RX_VK_PRECOMPILE_COMPUTES, vk_draw.cpp)
 ComputePlan computes_plan(const char*,bool states) {
  assert(states==!omit_states); calls.push_back(2); ComputePlan p; p.none=omit_computes; return p;
 }

@@ -31,7 +31,7 @@ def check_source():
     if '#include "mirror_budget.h"' not in mem:
         raise SystemExit("vk_memory.cpp no longer includes mirror_budget.h")
     budget = block(mem, "uint64_t mirror_budget() {")
-    for needle in ['getenv("RX_VK_MIRROR_MB")', "mirror_rule::auto_bytes(device_vram_bytes())"]:
+    for needle in ['getenv("RX_VK_MIRROR_MB")', "mirror_rule::auto_bytes(vram)"]:
         if needle not in budget:
             raise SystemExit("vk_memory.cpp: mirror_budget() no longer has: " + needle)
     if "vram / 8" in budget or "vram / 4" in budget:

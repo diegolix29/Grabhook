@@ -140,10 +140,14 @@ void hos_control_log(const char *line) { (void)line; }
 void hos_log_flush(void) {}
 static void log_flush(void) {}
 void hos_backtrace(void) {}
+void hl_trace_on_crash(Ctx *c, uint64_t why) { (void)c, (void)why; }   /* (HL_TRACE: off here) */
 void hos_hostcall_stats(void) {}
+/* (host/log_redact.c's, as it is for a run with no home folder in its lines) */
+static size_t hos_log_redact(char *out, size_t cap, const char *line) { snprintf(out, cap, "%s", line); return strlen(out); }
 /* HOS_LOG */
 /* HOS_FATAL */
 void rx_close_asked(void) {}
+void hos_fs_wait_writes(void) {}
 /* CLOSE_FINISH */
 /* CONTROL_QUIT */
 static int relaunch_asked = 1;

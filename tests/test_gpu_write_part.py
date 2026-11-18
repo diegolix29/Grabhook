@@ -130,7 +130,7 @@ def main():
     for needle, why in [
         ('static const bool gpu_write_whole = env_on("RX_VK_GPU_WRITE_WHOLE")',
          "asking for the whole image again on a GPU write has no switch"),
-        ("const bool gpu_part = !no_partial && !gpu_write_whole && tex->uploaded && !tex->sparse;",
+        ("const bool gpu_part = !gpu_write_whole && tex->uploaded && !tex->sparse;",
          "the GPU-write part does not say what it applies to (sparse images keep the whole path)"),
         ("gpu_wrote_into(*tex, gpu_part ? &dirty : nullptr)", "the GPU-write marking does not report the ranges it found"),
         ("if (gpu_partial) {", "the CPU's writes since a GPU write are not taken into the same part"),

@@ -50,6 +50,7 @@ void logf_at(LogLevel, const char*, ...) {}
 // (texture_frame's: Linux memory pressure is on, and it has just begun; VRAM is near what the driver allows. The cases
 // set them)
 bool linux_pressed = false, linux_entered_pressure = false, pool_pressed = false;
+uint8_t pool_pressure = 0;   // (vk_texture.cpp: 0 normal, 1 pressed, 2 critical)
 // (staging()'s count of every arena it makes, and their time: the log's "staging ... made so far")
 std::atomic<uint64_t> st_arena_makes{0};
 std::atomic<int64_t> st_arena_make_ns{0};
@@ -128,14 +129,14 @@ int run(int argc, char** argv) {
         // VRAM near what the driver allows (over 90% of it, or Linux memory pressure on an integrated GPU): the rule is off,
         // and what stays is what the card keeps between loads, as before the rule. On a card of 6.5 GB or less the arenas are
         // VRAM behind the BAR: the 192 MB more would come off what a load's textures need
-        pool_pressed = true;
+        pool_pressure = 1;
         frame({60 * MB, 60 * MB, 60 * MB, 60 * MB, 60 * MB, 60 * MB});
         require(arenas.size() == 6, "six arenas for six pieces of 60 MB");
         frame({});
         require(held() == 64 * MB, "VRAM short: 64 MB kept, not a burst's 256 MB");
         for (int i = 0; i < 20; i++) frame({1 * MB});
         require(makes >= 14, "VRAM short: an arena made every second frame, as before the rule");
-        pool_pressed = false;   // (room again: the rule is back)
+        pool_pressure = 0;   // (room again: the rule is back)
         const unsigned before = makes;
         for (int i = 0; i < 20; i++) frame({1 * MB});
         require(makes <= before + 1, "room again: two arenas take turns, none made every second frame");

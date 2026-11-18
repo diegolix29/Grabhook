@@ -334,9 +334,7 @@ int prepare(VkCommandBuffer cmd, uint32_t rw, uint32_t rh, uint32_t ow, uint32_t
                                           kPresetSettle);
     // (the game's native HDR: State::feature_hdr. What the game presents, not the option and the swapchain: with Native
     // picked and the game's picture not PQ, the scene is LDR, and an HDR feature would get LDR colour)
-    // (RX_VK_DLSS_HDR=0: the LDR feature and the clamped colour with Native too, as before this; for comparisons)
-    static const bool hdr_allowed = !getenv("RX_VK_DLSS_HDR") || atoi(getenv("RX_VK_DLSS_HDR")) != 0;
-    const bool hdr = hdr_allowed && present_native_pq.load(std::memory_order_relaxed);
+    const bool hdr = present_native_pq.load(std::memory_order_relaxed);
     if (s.feature && s.feature_ow == ow && s.feature_oh == oh && rw <= s.feature_rw && rh <= s.feature_rh &&
         rw >= s.min_rw && rh >= s.min_rh && s.feature_preset == preset && s.feature_hdr == hdr &&
         (!native_aa || s.feature_aa))
@@ -1183,7 +1181,17 @@ void dlss_fg_close() {
     const auto until = std::chrono::steady_clock::now() + std::chrono::seconds(2);
     std::unique_lock qk(dev.present_mu, std::defer_lock);
     while (!qk.try_lock() && std::chrono::steady_clock::now() < until) std::this_thread::sleep_for(std::chrono::milliseconds(1));
-    if (!qk.owns_lock()) {
+    // (and the presents' own queues, whose presents let dev.present_mu go while they run: a present stuck there held
+    // device_wait_idle_locked on its lock with no end. Free once while present_mu is held, they stay free: a present takes
+    // present_mu first; only the presenter thread's (RX_VK_PRESENT_THREAD, opt-in) does not)
+    const auto free_by_then = [&](std::mutex& m) {
+        for (;;) {
+            if (m.try_lock()) return m.unlock(), true;
+            if (std::chrono::steady_clock::now() >= until) return false;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    };
+    if (!qk.owns_lock() || !free_by_then(dev.present_queue_mu) || !free_by_then(dev.presenter_queue_mu)) {
         logf("vk: DLSS Frame Gen (NGX): the queue stayed busy at the exit: its feature left to the process's end");
         return;
     }

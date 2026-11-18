@@ -137,6 +137,15 @@ static void relaunch(void) {
 
 extern char **environ;
 
+static int start_err_given = 1;   /* (whether the game was started with a stderr: hos_relaunch_keep_env) */
+
+void hos_relaunch_keep_env(void) {
+    /* (the environment is read again from /proc/self/environ; kept here, before hos_main.c opens hookshot_log.txt as stderr
+       for a game given none, by the same test as hos_main.c's, is whether it was given one) */
+    const HANDLE err = GetStdHandle(STD_ERROR_HANDLE);
+    start_err_given = err && err != INVALID_HANDLE_VALUE && GetFileType(err) != FILE_TYPE_UNKNOWN;
+}
+
 static void relaunch(void) {
     HosRelaunch r;
     if (!hos_relaunch_command("/proc/self/cmdline", "/proc/self/environ", &r)) {
@@ -155,9 +164,18 @@ static void relaunch(void) {
         closedir(d);
     }
     fflush(NULL);
+    /* (a game given no stderr has its own log there, which execve would keep: the new run would take it for a stderr it was
+       given, and neither move it to .1 nor name it for the crash window. It is given none again; its log back if the exec fails) */
+    int log_err = -1;
+    if (!start_err_given) {
+        const int none = open("/dev/null", O_WRONLY | O_CLOEXEC);
+        if (none >= 0 && (log_err = fcntl(STDERR_FILENO, F_DUPFD_CLOEXEC, 0)) >= 0) dup2(none, STDERR_FILENO);
+        if (none >= 0) close(none);
+    }
     execve("/proc/self/exe", r.argv, r.envp);
     environ = r.envp;   /* (execvp searches the PATH of the environment it is given: the one the game started with) */
     execvp(r.argv[0], r.argv);
+    if (log_err >= 0) dup2(log_err, STDERR_FILENO), close(log_err);
     hos_log("restart: the game could not be started again: it only exits");
     hos_log_flush();
 }
@@ -166,7 +184,9 @@ static void relaunch(void) {
 /* Shared tail after rx_close_asked returned. No process exit or restart here: the Windows stop worker must
    keep its watchdog alive until all explicit close work and the log flush have returned. */
 void hos_close_finish(void) {
-    hos_log("stop: close work done (the game's saves are not waited for)");
+    void hos_fs_wait_writes(void);   /* (nn_fs.c: a file the game is writing, up to 3 s) */
+    hos_fs_wait_writes();
+    hos_log("stop: close work done (a file the game was writing waited for, at most 3 s)");
     hos_log_flush();
     void hos_crash_clean_end(void);
     hos_crash_clean_end();
@@ -175,14 +195,7 @@ void hos_close_finish(void) {
 /* The window was closed (host/display.c's WM_CLOSE, host/posix/display_sdl.c's quit): the game exits, and starts again
    first when the menu asked for it */
 void hos_window_closed_exit(void) {
-    {   /* (hookshot) a save being written goes to its end first: up to 3 s while a file open for writing was
-           written in the last second (host/nn_fs.c). The game's threads go on meanwhile */
-        int hos_fs_writing(void);
-        const int64_t t0 = hos_now_ns();
-        int waited = 0;
-        while (hos_fs_writing() && hos_now_ns() - t0 < 3000000000LL) waited = 1, hos_sleep_ns(10000000);
-        if (waited) hos_log("display: the window closed while the game wrote a file: waited %.0f ms for it", (hos_now_ns() - t0) / 1e6);
-    }
+    /* (a save being written goes to its end first: hos_close_finish waits for it, host/nn_fs.c) */
     const int again = relaunch_asked != 0;
     hos_log(again ? "display: window closed for a restart (the Insert menu's Restart now)" : "display: window closed, exiting");
     hos_close_finish();

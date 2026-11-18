@@ -68,7 +68,7 @@ def main():
     tex = (a.source / "gpu/vk/vk_texture.cpp").read_text(encoding="utf-8")
     check_source(tex)
     start = tex.index("struct Pooled {")
-    end = tex.index("bool pool_pressed;", start) + len("bool pool_pressed;")
+    end = tex.index("uint8_t pool_pressure = 0;", start) + len("uint8_t pool_pressure = 0;")
     pool = tex[start:end]
     actual = "\n".join([
         block(tex, "uint64_t mix("),

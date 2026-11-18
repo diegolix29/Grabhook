@@ -67,6 +67,7 @@ def run(tmp, cats_text=None, extra=(), candidates=None, guest=True, samples=None
     scripts = tmp / "scripts"
     scripts.mkdir(exist_ok=True)
     (scripts / "cpu_report.py").write_text(SCRIPT.read_text(encoding="utf-8"), encoding="utf-8")
+    (scripts / "samples.py").write_text((ROOT / "scripts" / "samples.py").read_text(encoding="utf-8"), encoding="utf-8")   # (its sample reader)
     text = cats_text if cats_text is not None else (ROOT / "scripts" / "cpu_categories.py").read_text(encoding="utf-8")
     (scripts / "cpu_categories.py").write_text(text, encoding="utf-8")
     # (a local guest map, as a developer would pass it; without it lifted code must be one row)

@@ -21,8 +21,8 @@ static class Saves
             {
                 var name = source.GetProperty("name").GetString()!;
                 // (emulators that share one save folder, Eden's forks: one row, its programs said under it)
-                var programs = source.GetProperty("display").GetString()!.Split(" / ").Where(n => n != "NX2navi").ToArray();
-                var shown = name == "nx2navi" ? "another PC port" : programs.Length > 1 ? "your emulator's save" : programs[0];
+                var programs = source.GetProperty("display").GetString()!.Split(" / ").Where(n => n != "another PC port").ToArray();
+                var shown = name == "pcport" ? "another PC port" : programs.Length > 1 ? "your emulator's save" : programs[0];
                 var who = programs.Length > 1 ? string.Join(", ", programs[..^1]) + " and " + programs[^1] + " keep their saves here · " : "";
                 foreach (var save in source.GetProperty("saves").EnumerateArray())
                 {
